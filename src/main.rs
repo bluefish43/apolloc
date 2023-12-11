@@ -283,7 +283,6 @@ fn apolloc_main() -> anyhow::Result<()> {
             let mut converter = ApolloBuilder::new_with(&context, &mut checker, &input_file)?;
             converter.start();
             converter.evaluate_all()?;
-            converter.end()?;
             converter.set_triple(&target_triple);
             if verbose {
                 eprintln!("{} Creating directory `./tmp`", VERBOSE_STRING.as_str());

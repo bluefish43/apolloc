@@ -1,7 +1,6 @@
 use crate::backend::{llvm::Type as LType, builder::ApolloBuilder};
 use crate::backend::llvm::*;
-use std::borrow::Cow;
-use std::{fmt::{self, Write}, str::FromStr};
+use std::fmt::{self, Write};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]

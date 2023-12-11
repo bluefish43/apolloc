@@ -59,6 +59,7 @@ macro_rules! untracked_mut {
 }
 
 impl<'b> ApolloBuilder<'b> {
+    /// Builds every statement to its equivalent LLVM bitcode
     pub fn evaluate_all(&mut self) -> Result<()> {
         for statement in untracked_mut!(self.checker.statements, Vec<(Token, Statement)>).iter_mut() {
             self.loc = statement.0.clone();
@@ -67,6 +68,8 @@ impl<'b> ApolloBuilder<'b> {
         Ok(())
     }
 
+    /// This function must be invoked before `evaluate_all`.
+    /// This function sets up the required functions and intrinsics used by the compiler, such as `malloc` and `__cxa_throw`.
     pub fn start(&mut self) {
         // void @_Unwind_RaiseException(i8*)
         // let unwind_raise_except_type = function_type(
@@ -139,12 +142,7 @@ impl<'b> ApolloBuilder<'b> {
 
     }
 
-    pub fn end(&mut self) -> Result<()> {
-
-
-        Ok(())
-    }
-
+    /// Creates a new builder with the specified `Context` and the specified `Checker`.
     pub fn new_with(
         context: &'b Context,
         checker: &'b mut Checker<'b>,
@@ -171,14 +169,17 @@ impl<'b> ApolloBuilder<'b> {
         })
     }
 
+    /// Dumps the inner module to the output stream.
     pub fn dump(&self) {
         self.module.dump()
     }
 
+    /// Sets the module's target triple.
     pub fn set_triple(&self, triple: &str) {
         self.module.set_target_triple(triple)
     }
 
+    /// Helper function to define a function.
     fn define_function(
         &mut self,
         function_name: &str,
@@ -270,6 +271,7 @@ impl<'b> ApolloBuilder<'b> {
         Ok(())
     }
 
+    /// Matches on an individual Statement and evaluates it.
     pub fn evaluate_statement(&mut self, statement: &Statement) -> Result<bool> {
         let mut returned = false;
         //eprintln!("{:?}", statement);
@@ -451,6 +453,7 @@ impl<'b> ApolloBuilder<'b> {
         Ok(returned)
     }
 
+    /// Helper function to evaluate all of the cleanup actions set in the frame.
     fn cleanup_action(&mut self, frame: &Frame) {
         for (action, params) in &frame.2 {
             match action {
@@ -462,6 +465,7 @@ impl<'b> ApolloBuilder<'b> {
         }
     }
 
+    /// Helper function to throw an exception.
     fn throw(&mut self, expression: &Expression) {
         let exception = self.evaluate_expression(expression, ExpressionEvaluatorData::default());
 
@@ -507,6 +511,7 @@ impl<'b> ApolloBuilder<'b> {
         self.builder.build_unreachable();
     }
 
+    /// Helper function to do a try-catch block.
     fn try_catch(
         &mut self,
         try_block: &(tokens::Token, Statement),
@@ -565,10 +570,12 @@ impl<'b> ApolloBuilder<'b> {
         Ok(())
     }
 
+    /// Gets the last catch label set up.
     fn get_last_catch(&mut self) -> BasicBlock {
         self.catch_labels.last().copied().unwrap()
     }
 
+    /// Helper function to declare a namespace.
     fn declare_namespace(
         &mut self,
         namespace_name: &str,
@@ -599,6 +606,7 @@ impl<'b> ApolloBuilder<'b> {
         Ok(())
     }
 
+    /// Builds a return to the specified expression.
     fn make_return(&mut self, expression: &Expression) {
         let scope = self.variable_stack.last().unwrap().clone();
         self.cleanup_action(&scope);
@@ -606,6 +614,7 @@ impl<'b> ApolloBuilder<'b> {
         self.builder.build_return(expression_value);
     }
 
+    /// Helper function to build an if-else conditional statement.
     fn if_else(
         &mut self,
         if_condition: &Expression,
@@ -647,6 +656,7 @@ impl<'b> ApolloBuilder<'b> {
         Ok(())
     }
 
+    /// Helper function to build a call to a function.
     fn call(
         &mut self,
         function_signature: &(tokens::Type, Vec<(String, tokens::Type)>, bool, bool),
@@ -694,6 +704,7 @@ impl<'b> ApolloBuilder<'b> {
         }
     }
 
+    /// Helper function to do a while-loop.
     fn while_loop(
         &mut self,
         while_condition: &Expression,
@@ -730,6 +741,7 @@ impl<'b> ApolloBuilder<'b> {
         Ok(())
     }
 
+    /// Helper function to do a do-while-loop.
     fn do_while_loop(
         &mut self,
         do_block: &Statement, // Changed the name to represent the do-while loop structure
@@ -759,6 +771,7 @@ impl<'b> ApolloBuilder<'b> {
         Ok(())
     }    
 
+    /// Helper function to declare a variable.
     fn declare_variable(&mut self, expression: &Expression, name: &str) {
         let expression_value = self.evaluate_expression(expression, ExpressionEvaluatorData { is_variable: true, get_variable_ptr: false, is_argument: true });
         let expression_type = expression_value.type_of();
@@ -770,6 +783,7 @@ impl<'b> ApolloBuilder<'b> {
         );
     }
 
+    /// Sets up a variable in the local scope.
     fn set_variable_in_local_scope(&mut self, name: &str, value: (Value, Type, Option<Value>)) {
         if let Some(frame) = self.find_variable_valueref_scope(name) {
             frame.0.insert(name.to_string(), value);
@@ -782,6 +796,7 @@ impl<'b> ApolloBuilder<'b> {
         }
     }
 
+    /// Searches for a variable. If it is found, it returns a Some with a mutable reference to the stack frame it is stored ta.
     fn find_variable_valueref_scope(&mut self, name: &str) -> OptionalFrame {
         for frame in self.variable_stack.iter_mut().rev() {
             if frame.0.get(name).is_some() {
@@ -793,6 +808,7 @@ impl<'b> ApolloBuilder<'b> {
         None
     }
 
+    /// Helper function to return the tuple that represents the variable in its scope if found.
     fn find_variable_valueref(&self, name: &str) -> Option<(Value, Type, Option<Value>)> {
         for frame in self.variable_stack.iter().rev() {
             if let Some(value) = frame.0.get(name) {
@@ -804,26 +820,31 @@ impl<'b> ApolloBuilder<'b> {
         None
     }
 
+    /// Unchecked variant.
     fn find_variable_valueref_unchecked(&self, name: &str) -> (Value, Type, Option<Value>) {
         self.find_variable_valueref(name).unwrap_or_else(|| {
             panic!("internal error: typechecking failed: attempt to search for an undefined variable {name} in Builder::find_variable_valueref_unchecked")
         })
     }
 
+    /// Gets a named function in the module as a Value
     fn find_function(&self, name: &str) -> Option<Value> {
         self.module.get_named_function(name).map(|v| *v)
     }
 
+    /// Gets a named function in the module as a Function
     fn find_function_fn(&self, name: &str) -> Option<Function> {
         self.module.get_named_function(name).map(|v| v)
     }
 
+    /// Unchecked variant.
     fn find_function_unchecked(&self, name: &str) -> Value {
         self.find_function(name).unwrap_or_else(|| {
             panic!("internal error: typechecking failed: attempt to search for an undefined function: {name}")
         })
     }
 
+    /// Unchecked variant.
     fn find_function_fn_unchecked(&self, name: &str) -> Function {
         self.find_function_fn(name).unwrap_or_else(|| {
             panic!("internal error: typechecking failed: attempt to search for an undefined function: {name}")
@@ -1326,19 +1347,6 @@ impl<'b> ApolloBuilder<'b> {
                 self.call(function_signature, args, function_name, *all_time_record_id)
             }
         }
-    }
-
-    pub fn set_up_libc(&mut self) -> Result<()> {
-        let function_type = function_type(int32_type_in_context(self.context), &[int32_type_in_context(self.context), pointer_type(int8_type_in_context(self.context), 0)], false);
-        self.define_function("__libc_start_main", &TType::I32, &[("".to_string(), TType::I32), ("".to_string(), TType::PointerTo(Box::new(TType::I8)))], None, false, false, &CallingConvention::X8664SystemV)?;
-        let start_fn = self.module.add_function("_start", function_type);
-        let start_block = BasicBlock::new_in_context(self.context, "___apolloc_rt_start_main");
-        self.builder.position_at_end(&start_block);
-        let start_main = self.find_function_fn_unchecked("__libc_start_main");
-        let result = self.builder.build_call(function_type, *start_main, &start_fn.get_parameters(), None);
-        self.builder.build_return(result);
-        start_fn.append_existing_basic_block(start_block);
-        Ok(())
     }
 
     /// This function gets the LLVM-generated bitcode of the module.
