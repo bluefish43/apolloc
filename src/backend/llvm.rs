@@ -8,9 +8,11 @@ use crate::c_str;
 use crate::frontend::ast::CallingConvention;
 use llvm_sys::analysis::*;
 use llvm_sys::core::*;
+use llvm_sys::debuginfo::LLVMDIBuilderCreateFile;
 use llvm_sys::prelude::*;
 use llvm_sys::target::*;
 use llvm_sys::*;
+use llvm_sys::transforms::pass_builder::*;
 
 macro_rules! opt_c_str {
     ($e:expr) => {
@@ -61,6 +63,10 @@ impl AsLLVMRef for Context {
     unsafe fn as_llvm_ref(&self) -> Self::Target {
         self.0
     }
+}
+
+pub fn get_enum_attribute_kind_for_name(name: &str) -> usize {
+    (unsafe { LLVMGetEnumAttributeKindForName(c_str!(name), name.len()) }) as usize
 }
 
 impl Context {
@@ -1692,9 +1698,42 @@ impl<'ctx> AsLLVMRef for Module<'ctx> {
 #[derive(Clone, Copy)]
 pub struct Type(LLVMTypeRef);
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord, Hash)]
+pub enum TypeKind {
+    Void,
+    Half,
+    Float,
+    Double,
+    X86_FP80,
+    FP128,
+    PPC_FP128,
+    Label,
+    Integer,
+    Function,
+    Struct,
+    Array,
+    Pointer,
+    Vector,
+    Metadata,
+    X86_MMX,
+    Token,
+    ScalableVector,
+    BFloat,
+    X86_AMX,
+    TargetExt,
+}
+
 impl Type {
     pub fn size_of_in_module(&self, module: &Module) -> u64 {
         unsafe { LLVMStoreSizeOfType(module.data_layout(), self.as_llvm_ref()) }
+    }
+
+    pub fn null() -> Self {
+        Self(null_mut())
+    }
+
+    pub fn kind(&self) -> TypeKind {
+        unsafe { std::mem::transmute(unsafe { LLVMGetTypeKind(self.0) } as c_char) }
     }
 
     pub fn align_of(&self) -> Value {
@@ -2050,7 +2089,7 @@ impl AsLLVMRef for BasicBlock {
 
 #[repr(transparent)]
 #[derive(Clone, Copy)]
-pub struct Function(Value);
+pub struct Function(pub Value);
 
 impl Function {
     pub fn verify(&self) -> Result<(), VerifyError> {
@@ -2733,6 +2772,12 @@ impl<'m> PassManager<'m> {
     pub fn finalize_function_pass_manager(&self) -> bool {
         (unsafe { LLVMFinalizeFunctionPassManager(self.as_llvm_ref()) } != 0)
     }
+
+    pub fn run(&self, module: &'m Module<'m>) {
+        unsafe {
+            LLVMRunPassManager(self.0, module.as_llvm_ref());
+        }
+    }
 }
 
 impl<'m> AsLLVMRef for PassManager<'m> {
@@ -2832,7 +2877,7 @@ pub fn double_type() -> Type {
     new_type!(LLVMDoubleType())
 }
 
-pub fn double_type_in_context(context: &Context) -> Type {
+pub fn float64_type_in_context(context: &Context) -> Type {
     new_type!(LLVMDoubleTypeInContext(context.as_llvm_ref()))
 }
 
@@ -2848,7 +2893,7 @@ pub fn floating_point_type() -> Type {
     new_type!(LLVMFloatType())
 }
 
-pub fn floating_point_type_in_context(context: &Context) -> Type {
+pub fn float32_type_in_context(context: &Context) -> Type {
     new_type!(LLVMFloatTypeInContext(context.as_llvm_ref()))
 }
 
@@ -3018,3 +3063,4 @@ pub fn initialize_native_asm_printer() -> Result<(), NativeAsmPrinterInitializat
 //     _URC_CONTINUE_UNWIND = 8
 //   }
 // _Unwind_Reason_Code;
+

@@ -1,6 +1,7 @@
 use crate::backend::{llvm::Type as LType, builder::ApolloBuilder};
 use crate::backend::llvm::*;
-use std::{fmt, str::FromStr};
+use std::borrow::Cow;
+use std::{fmt::{self, Write}, str::FromStr};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
@@ -18,12 +19,14 @@ pub enum Type {
     String,
     Bool,
     PointerTo(Box<Type>),
+    OpaquePtr,
     Struct {
         name: String,
         fields: Vec<(String, Type)>,
         packed: bool,
     },
     None,
+    Slice(Box<Type>),
 }
 
 impl fmt::Display for Type {
@@ -44,13 +47,65 @@ impl fmt::Display for Type {
             Type::PointerTo(t) => write!(f, "*{t}"),
             Type::Struct { name, .. } => write!(f, "{name}"),
             Type::None => write!(f, "none"),
+            Type::OpaquePtr => write!(f, "opaqueptr"),
+            Type::Slice(t) => write!(f, "[]{t}"),
         }
     }
 }
 
+macro_rules! string {
+    ($e:expr) => {
+        ($e.to_string())
+    }
+}
+
 impl Type {
+    pub fn mangled(&self) -> String {
+        match self {
+            Type::I8 => string!("00"),
+            Type::I16 => string!("01"),
+            Type::I32 => string!("02"),
+            Type::I64 => string!("03"),
+            Type::U8 => string!("04"),
+            Type::U16 => string!("05"),
+            Type::U32 => string!("06"),
+            Type::U64 => string!("07"),
+            Type::F32 => string!("08"),
+            Type::F64 => string!("09"),
+            Type::String => string!("0A"),
+            Type::Bool => string!("0B"),
+            Type::PointerTo(t) => format!("0C*{}", t.mangled()),
+            Type::Struct { name, fields, packed } => {
+                let mut output = if *packed {
+                    string!("0D..")
+                } else {
+                    string!("0E..")
+                };
+                let _ = write!(output, "{name},{}$", fields.len());
+                for field in fields {
+                    let _ = write!(output, "#{}", field.1.mangled());
+                }
+                output
+            },
+            Type::None => string!("0E"),
+            Type::OpaquePtr => string!("0F"),
+            Type::Slice(t) => format!("10&{}", t.mangled()),
+        }
+    }
+
+    pub fn unwrap_ptr(self) -> Type {
+        match self {
+            Type::PointerTo(t) => *t,
+            _ => panic!("Called unwrap_ptr on non-ptr type"),
+        }
+    }
+
     pub fn is_unsigned_int(&self) -> bool {
         matches!(self, Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::PointerTo(_) | Type::Bool)
+    }
+
+    pub fn is_struct(&self) -> bool {
+        matches!(self, Type::Struct {..})
     }
 
     pub fn is_signed_int(&self) -> bool {
@@ -73,8 +128,8 @@ impl Type {
             Type::I16 | Type::U16 => int16_type_in_context(ctx),
             Type::I32 | Type::U32 => int32_type_in_context(ctx),
             Type::I64 | Type::U64 => int64_type_in_context(ctx),
-            Type::F64 => double_type_in_context(ctx),
-            Type::F32 => floating_point_type_in_context(ctx),
+            Type::F64 => float64_type_in_context(ctx),
+            Type::F32 => float32_type_in_context(ctx),
             Type::Bool => int1_type_in_context(ctx),
             Type::String => {
                 let i8_type = int8_type_in_context(ctx);
@@ -93,17 +148,21 @@ impl Type {
                 *packed,
             ), 0),
             Type::None => void_type_in_context(ctx),
+            Type::OpaquePtr => pointer_type(void_type_in_context(ctx), 0),
+            Type::Slice(t) => {
+                ctx.struct_type(&[int32_type_in_context(ctx), pointer_type(t.as_type_in_context(ctx), 0)], false)
+            }
         }
     }
 
-    pub fn as_type_in_builder(&self, ctx: &ApolloBuilder) -> LType {
+    pub fn as_type_in_builder(&self, ctx: &ApolloBuilder, is_arg_t: bool) -> LType {
         match self {
             Type::I8 | Type::U8 => int8_type_in_context(ctx.context),
             Type::I16 | Type::U16 => int16_type_in_context(ctx.context),
             Type::I32 | Type::U32 => int32_type_in_context(ctx.context),
             Type::I64 | Type::U64 => int64_type_in_context(ctx.context),
-            Type::F64 => double_type_in_context(ctx.context),
-            Type::F32 => floating_point_type_in_context(ctx.context),
+            Type::F64 => float64_type_in_context(ctx.context),
+            Type::F32 => float32_type_in_context(ctx.context),
             Type::Bool => int1_type_in_context(ctx.context),
             Type::String => {
                 let i8_type = int8_type_in_context(ctx.context);
@@ -116,6 +175,26 @@ impl Type {
                 packed,
             } => ctx.struct_types.get(name).copied().unwrap(),
             Type::None => void_type_in_context(ctx.context),
+            Type::OpaquePtr => pointer_type(void_type_in_context(ctx.context), 0),
+            Type::Slice(t) => {
+                ctx.context.struct_type(&[int32_type_in_context(ctx.context), pointer_type(t.as_type_in_builder(ctx, false), 0)], false)
+            }
+        }
+    }
+
+    pub fn arg_type(&self, ctx: &ApolloBuilder) -> (LType, Vec<Attribute>) {
+        match self {
+            Type::Struct {
+                name,
+                fields,
+                packed,
+            } => {
+                let struct_type = ctx.struct_types.get(name).copied().unwrap();
+                let kind_id = get_enum_attribute_kind_for_name("byval");
+                let by_val_attribute = ctx.context.create_type_attribute(kind_id as u32, struct_type);
+                (pointer_type(struct_type, 0), vec![by_val_attribute])
+            }
+            _ => (self.as_type_in_builder(ctx, true), vec![]),
         }
     }
 }
@@ -133,9 +212,13 @@ pub enum TokenKind {
     Int(i64, Type),
     Float(f64, Type),
     String(String),
+    Char(u32),
     Boolean(bool),
     None,
+    Null,
 
+    DoubleColon,
+    PtrAccess,
     Plus,
     Minus,
     Times,
@@ -182,6 +265,13 @@ pub enum TokenKind {
 impl fmt::Display for TokenKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            TokenKind::DoubleColon => write!(f, "::"),
+            TokenKind::Char(c) => write!(f, "{} (char)", unsafe { if let Some(c) = char::from_u32(*c) {
+                c.to_string()
+            } else {
+                "(bad char)".to_string()
+            } } ),
+            TokenKind::PtrAccess => write!(f, "->"),
             TokenKind::Keyword(i) => write!(f, "{i} (keyword)"),
             TokenKind::Ident(i) => write!(f, "{i} (identifier)"),
             TokenKind::Type(t) => write!(f, "{t} (type)"),
@@ -189,6 +279,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Int(i, t) => write!(f, "{i}{t}"),
             TokenKind::Float(fl, t) => write!(f, "{fl}{t}"),
             TokenKind::None => write!(f, "none"),
+            TokenKind::Null => write!(f, "null"),
             TokenKind::String(s) => write!(f, "{:?}", s),
             TokenKind::Boolean(b) => write!(f, "{b}"),
             TokenKind::Plus => write!(f, "+"),
@@ -245,6 +336,24 @@ pub struct Token {
     pub defined_file_name: String,
 }
 
+macro_rules! current_file {
+    () => {
+        {
+            use memcmc::cell::CellInterface;
+            $crate::CURRENT_FILE.get().clone()
+        }
+    }
+}
+
+macro_rules! current_file_name {
+    () => {
+        {
+            use memcmc::cell::CellInterface;
+            $crate::CURRENT_FILE_NAME.get().clone()
+        }
+    }
+}
+
 impl Default for Token {
     fn default() -> Self {
         Self {
@@ -252,8 +361,8 @@ impl Default for Token {
             length: 1,
             line: 1,
             col: 1,
-            defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-            defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+            defined_file: Some(current_file!()),
+            defined_file_name: current_file_name!(),
         }
     }
 }
@@ -294,8 +403,8 @@ impl Tokenizer {
                                 length: 2,
                                 line: self.line,
                                 col: self.column,
-                                defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                                defined_file: Some(current_file!()),
+                                defined_file_name: current_file_name!(),
                             });
                             self.column += 2
                         } else {
@@ -369,20 +478,33 @@ impl Tokenizer {
                             length: len,
                             line: self.line,
                             col: self.column,
-                            defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                            defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                            defined_file: Some(current_file!()),
+                            defined_file_name: current_file_name!(),
                         });
                     }
                     ':' => {
-                        self.tokens.push(Token {
-                            kind: TokenKind::Colon,
-                            length: 1,
-                            line: self.line,
-                            col: self.column,
-                            defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                            defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
-                        });
-                        self.column += 1;
+                        if iter.peek() == Some(&':') {
+                            iter.next();
+                            self.tokens.push(Token {
+                                kind: TokenKind::DoubleColon,
+                                length: 2,
+                                line: self.line,
+                                col: self.column,
+                                defined_file: Some(current_file!()),
+                                defined_file_name: current_file_name!(),
+                            });
+                            self.column += 2;
+                        } else {
+                            self.tokens.push(Token {
+                                kind: TokenKind::Colon,
+                                length: 1,
+                                line: self.line,
+                                col: self.column,
+                                defined_file: Some(current_file!()),
+                                defined_file_name: current_file_name!(),
+                            });
+                            self.column += 1;
+                        }
                     }
                     ';' => {
                         self.tokens.push(Token {
@@ -390,8 +512,8 @@ impl Tokenizer {
                             length: 1,
                             line: self.line,
                             col: self.column,
-                            defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                            defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                            defined_file: Some(current_file!()),
+                            defined_file_name: current_file_name!(),
                         });
                         self.column += 1;
                     }
@@ -423,9 +545,8 @@ impl Tokenizer {
                                         length: number.len() + underscores_length,
                                         line: self.line,
                                         col: self.column,
-                                        defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                        defined_file_name: unsafe { &CURRENT_FILE_NAME }
-                                            .to_string(),
+                                        defined_file: Some(current_file!()),
+                                        defined_file_name: current_file_name!(),
                                     });
                                     self.column += number.len() + underscores_length;
                                 }
@@ -450,9 +571,8 @@ impl Tokenizer {
                                         length: number.len() + underscores_length,
                                         line: self.line,
                                         col: self.column,
-                                        defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                        defined_file_name: unsafe { &CURRENT_FILE_NAME }
-                                            .to_string(),
+                                        defined_file: Some(current_file!()),
+                                        defined_file_name: current_file_name!(),
                                     });
                                     self.column += number.len() + underscores_length;
                                 }
@@ -475,9 +595,8 @@ impl Tokenizer {
                                         length: number.len() + underscores_length,
                                         line: self.line,
                                         col: self.column,
-                                        defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                        defined_file_name: unsafe { &CURRENT_FILE_NAME }
-                                            .to_string(),
+                                        defined_file: Some(current_file!()),
+                                        defined_file_name: current_file_name!(),
                                     });
                                     self.column += number.len() + underscores_length;
                                 }
@@ -503,9 +622,8 @@ impl Tokenizer {
                                         length: number.len() + underscores_length,
                                         line: self.line,
                                         col: self.column,
-                                        defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                        defined_file_name: unsafe { &CURRENT_FILE_NAME }
-                                            .to_string(),
+                                        defined_file: Some(current_file!()),
+                                        defined_file_name: current_file_name!(),
                                     });
                                     self.column += number.len() + underscores_length;
                                 }
@@ -531,9 +649,8 @@ impl Tokenizer {
                                         length: number.len() + underscores_length,
                                         line: self.line,
                                         col: self.column,
-                                        defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                        defined_file_name: unsafe { &CURRENT_FILE_NAME }
-                                            .to_string(),
+                                        defined_file: Some(current_file!()),
+                                        defined_file_name: current_file_name!(),
                                     });
                                     self.column += number.len() + underscores_length;
                                 }
@@ -559,9 +676,8 @@ impl Tokenizer {
                                         length: number.len() + underscores_length,
                                         line: self.line,
                                         col: self.column,
-                                        defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                        defined_file_name: unsafe { &CURRENT_FILE_NAME }
-                                            .to_string(),
+                                        defined_file: Some(current_file!()),
+                                        defined_file_name: current_file_name!(),
                                     });
                                     self.column += number.len() + underscores_length;
                                 }
@@ -587,9 +703,8 @@ impl Tokenizer {
                                         length: number.len() + underscores_length,
                                         line: self.line,
                                         col: self.column,
-                                        defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                        defined_file_name: unsafe { &CURRENT_FILE_NAME }
-                                            .to_string(),
+                                        defined_file: Some(current_file!()),
+                                        defined_file_name: current_file_name!(),
                                     });
                                     self.column += number.len() + underscores_length;
                                 }
@@ -615,9 +730,8 @@ impl Tokenizer {
                                         length: number.len() + underscores_length,
                                         line: self.line,
                                         col: self.column,
-                                        defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                        defined_file_name: unsafe { &CURRENT_FILE_NAME }
-                                            .to_string(),
+                                        defined_file: Some(current_file!()),
+                                        defined_file_name: current_file_name!(),
                                     });
                                     self.column += number.len() + underscores_length;
                                 }
@@ -643,9 +757,8 @@ impl Tokenizer {
                                         length: number.len() + underscores_length,
                                         line: self.line,
                                         col: self.column,
-                                        defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                        defined_file_name: unsafe { &CURRENT_FILE_NAME }
-                                            .to_string(),
+                                        defined_file: Some(current_file!()),
+                                        defined_file_name: current_file_name!(),
                                     });
                                     self.column += number.len() + underscores_length;
                                 }
@@ -671,9 +784,8 @@ impl Tokenizer {
                                         length: number.len() + underscores_length,
                                         line: self.line,
                                         col: self.column,
-                                        defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                        defined_file_name: unsafe { &CURRENT_FILE_NAME }
-                                            .to_string(),
+                                        defined_file: Some(current_file!()),
+                                        defined_file_name: current_file_name!(),
                                     });
                                     self.column += number.len() + underscores_length;
                                 }
@@ -698,9 +810,8 @@ impl Tokenizer {
                                         length: number.len() + underscores_length,
                                         line: self.line,
                                         col: self.column,
-                                        defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                        defined_file_name: unsafe { &CURRENT_FILE_NAME }
-                                            .to_string(),
+                                        defined_file: Some(current_file!()),
+                                        defined_file_name: current_file_name!(),
                                     });
                                     self.column += number.len() + underscores_length;
                                 }
@@ -825,10 +936,122 @@ impl Tokenizer {
                             length: strlen + 2,
                             line: self.line,
                             col: self.column,
-                            defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                            defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                            defined_file: Some(current_file!()),
+                            defined_file_name: current_file_name!(),
                         });
                         self.column += strlen + 2;
+                    }
+                    '\'' => {
+                        let c = iter.next();
+                        match c {
+                            Some(ch) => {
+                                let c: u32 = match ch {
+                                    '\"' => {
+                                        '"' as u32
+                                    }
+                                    '\n' => {
+                                        '\n' as u32
+                                    }
+                                    '\r' => {
+                                        '\r' as u32
+                                    }
+                                    '\\' => match iter.next() {
+                                        Some(c) => match c {
+                                            'n' => {
+                                                '\n' as u32
+                                            }
+                                            'r' => {
+                                                '\r' as u32
+                                            }
+                                            't' => {
+                                                '\t' as u32
+                                            }
+                                            '\\' => {
+                                                '\\' as u32
+                                            }
+                                            '0' => {
+                                                '\0' as u32
+                                            }
+                                            'u' => {
+                                                let mut digits = String::new();
+                                                for _ in 0..4 {
+                                                    match iter.next() {
+                                                        Some(digit) => {
+                                                            digits.push(digit);
+                                                        }
+                                                        None => {
+                                                            return Err((
+                                                                "A unicode escape sequence must have 4 hexadecimal digits in the sense of \\u{{7FFF}}".to_string(),
+                                                            self.line, self.column, digits.len()))
+                                                        }
+                                                    }
+                                                }
+                                                if let Ok(num) = digits.parse::<u32>() {
+                                                    num
+                                                } else if let Err(err) = digits.parse::<u32>() {
+                                                    return Err((format!(
+                                                        "Error during unicode escape sequence '\\u{}' parsing: {}",
+                                                        digits, err
+                                                    ), self.line, self.column, digits.len()));
+                                                } else {
+                                                    unreachable!()
+                                                }
+                                            }
+                                            '"' => {
+                                                '"' as u32
+                                            }
+                                            _ => {
+                                                return Err((
+                                                    format!("Unknown escape sequence '\\{}'", c),
+                                                    self.line,
+                                                    self.column,
+                                                    1
+                                                ))
+                                            }
+                                        },
+                                        None => {
+                                            return Err((
+                                                "Unclosed char literal".to_string(),
+                                                self.line,
+                                                self.column,
+                                                2
+                                            ));
+                                        }
+                                    },
+                                    _ => {
+                                        ch as u32
+                                    }
+                                };
+                                match iter.next() {
+                                    Some('\'') => {
+                                        self.tokens.push(Token {
+                                            kind: TokenKind::Char(c),
+                                            length: 3,
+                                            line: self.line,
+                                            col: self.column,
+                                            defined_file: Some(current_file!()),
+                                            defined_file_name: current_file_name!(),
+                                        });
+                                    }
+                                    _ => {
+                                        return Err((
+                                            "Unclosed char literal".to_string(),
+                                            self.line,
+                                            self.column,
+                                            1
+                                        ));
+                                    }
+                                }
+                            }
+                            _ => {
+                                return Err((
+                                    "Unclosed char literal".to_string(),
+                                    self.line,
+                                    self.column,
+                                    1
+                                ));
+                            }
+                        }
                     }
                     '!' if iter.peek() == Some(&'=') => {
                         iter.next();
@@ -837,8 +1060,8 @@ impl Tokenizer {
                             length: 2,
                             line: self.line,
                             col: self.column,
-                            defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                            defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                            defined_file: Some(current_file!()),
+                            defined_file_name: current_file_name!(),
                         });
                         self.column += 2;
                     }
@@ -848,8 +1071,8 @@ impl Tokenizer {
                             length: 1,
                             line: self.line,
                             col: self.column,
-                            defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                            defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                            defined_file: Some(current_file!()),
+                            defined_file_name: current_file_name!(),
                         });
                         self.column += 1;
                     }
@@ -861,8 +1084,8 @@ impl Tokenizer {
                                 length: 2,
                                 line: self.line,
                                 col: self.column,
-                                defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                                defined_file: Some(current_file!()),
+                                defined_file_name: current_file_name!(),
                             });
                             self.column += 2;
                         } else {
@@ -871,8 +1094,8 @@ impl Tokenizer {
                                 length: 1,
                                 line: self.line,
                                 col: self.column,
-                                defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                                defined_file: Some(current_file!()),
+                                defined_file_name: current_file_name!(),
                             });
                             self.column += 1;
                         }
@@ -885,10 +1108,23 @@ impl Tokenizer {
                                 length: 2,
                                 line: self.line,
                                 col: self.column,
-                                defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                                defined_file: Some(current_file!()),
+                                defined_file_name: current_file_name!(),
                             });
                             self.column += 2;
+                            continue;
+                        } else if let Some(&'>') = iter.peek() {
+                            iter.next();
+                            self.tokens.push(Token {
+                                kind: TokenKind::PtrAccess,
+                                length: 2,
+                                line: self.line,
+                                col: self.column,
+                                defined_file: Some(current_file!()),
+                                defined_file_name: current_file_name!(),
+                            });
+                            self.column += 2;
+                            continue;
                         }
                         if let Some(c) = iter.peek() {
                             if c.is_numeric() {
@@ -920,10 +1156,9 @@ impl Tokenizer {
                                                 line: self.line,
                                                 col: self.column,
                                                 defined_file: Some(
-                                                    unsafe { &CURRENT_FILE }.to_string(),
+                                                    current_file!(),
                                                 ),
-                                                defined_file_name: unsafe { &CURRENT_FILE_NAME }
-                                                    .to_string(),
+                                                defined_file_name: current_file_name!(),
                                             });
                                             self.column += number.len() + underscores_length;
                                         }
@@ -949,10 +1184,9 @@ impl Tokenizer {
                                                 line: self.line,
                                                 col: self.column,
                                                 defined_file: Some(
-                                                    unsafe { &CURRENT_FILE }.to_string(),
+                                                    current_file!(),
                                                 ),
-                                                defined_file_name: unsafe { &CURRENT_FILE_NAME }
-                                                    .to_string(),
+                                                defined_file_name: current_file_name!(),
                                             });
                                             self.column += number.len() + underscores_length;
                                         }
@@ -976,10 +1210,9 @@ impl Tokenizer {
                                                 line: self.line,
                                                 col: self.column,
                                                 defined_file: Some(
-                                                    unsafe { &CURRENT_FILE }.to_string(),
+                                                    current_file!(),
                                                 ),
-                                                defined_file_name: unsafe { &CURRENT_FILE_NAME }
-                                                    .to_string(),
+                                                defined_file_name: current_file_name!(),
                                             });
                                             self.column += number.len() + underscores_length;
                                         }
@@ -1006,10 +1239,9 @@ impl Tokenizer {
                                                 line: self.line,
                                                 col: self.column,
                                                 defined_file: Some(
-                                                    unsafe { &CURRENT_FILE }.to_string(),
+                                                    current_file!(),
                                                 ),
-                                                defined_file_name: unsafe { &CURRENT_FILE_NAME }
-                                                    .to_string(),
+                                                defined_file_name: current_file_name!(),
                                             });
                                             self.column += number.len() + underscores_length;
                                         }
@@ -1036,10 +1268,9 @@ impl Tokenizer {
                                                 line: self.line,
                                                 col: self.column,
                                                 defined_file: Some(
-                                                    unsafe { &CURRENT_FILE }.to_string(),
+                                                    current_file!(),
                                                 ),
-                                                defined_file_name: unsafe { &CURRENT_FILE_NAME }
-                                                    .to_string(),
+                                                defined_file_name: current_file_name!(),
                                             });
                                             self.column += number.len() + underscores_length;
                                         }
@@ -1066,10 +1297,9 @@ impl Tokenizer {
                                                 line: self.line,
                                                 col: self.column,
                                                 defined_file: Some(
-                                                    unsafe { &CURRENT_FILE }.to_string(),
+                                                    current_file!(),
                                                 ),
-                                                defined_file_name: unsafe { &CURRENT_FILE_NAME }
-                                                    .to_string(),
+                                                defined_file_name: current_file_name!(),
                                             });
                                             self.column += number.len() + underscores_length;
                                         }
@@ -1096,10 +1326,9 @@ impl Tokenizer {
                                                 line: self.line,
                                                 col: self.column,
                                                 defined_file: Some(
-                                                    unsafe { &CURRENT_FILE }.to_string(),
+                                                    current_file!(),
                                                 ),
-                                                defined_file_name: unsafe { &CURRENT_FILE_NAME }
-                                                    .to_string(),
+                                                defined_file_name: current_file_name!(),
                                             });
                                             self.column += number.len() + underscores_length;
                                         }
@@ -1126,10 +1355,9 @@ impl Tokenizer {
                                                 line: self.line,
                                                 col: self.column,
                                                 defined_file: Some(
-                                                    unsafe { &CURRENT_FILE }.to_string(),
+                                                    current_file!(),
                                                 ),
-                                                defined_file_name: unsafe { &CURRENT_FILE_NAME }
-                                                    .to_string(),
+                                                defined_file_name: current_file_name!(),
                                             });
                                             self.column += number.len() + underscores_length;
                                         }
@@ -1156,10 +1384,9 @@ impl Tokenizer {
                                                 line: self.line,
                                                 col: self.column,
                                                 defined_file: Some(
-                                                    unsafe { &CURRENT_FILE }.to_string(),
+                                                    current_file!(),
                                                 ),
-                                                defined_file_name: unsafe { &CURRENT_FILE_NAME }
-                                                    .to_string(),
+                                                defined_file_name: current_file_name!(),
                                             });
                                             self.column += number.len() + underscores_length;
                                         }
@@ -1186,10 +1413,9 @@ impl Tokenizer {
                                                 line: self.line,
                                                 col: self.column,
                                                 defined_file: Some(
-                                                    unsafe { &CURRENT_FILE }.to_string(),
+                                                    current_file!(),
                                                 ),
-                                                defined_file_name: unsafe { &CURRENT_FILE_NAME }
-                                                    .to_string(),
+                                                defined_file_name: current_file_name!(),
                                             });
                                             self.column += number.len() + underscores_length;
                                         }
@@ -1215,10 +1441,9 @@ impl Tokenizer {
                                                 line: self.line,
                                                 col: self.column,
                                                 defined_file: Some(
-                                                    unsafe { &CURRENT_FILE }.to_string(),
+                                                    current_file!(),
                                                 ),
-                                                defined_file_name: unsafe { &CURRENT_FILE_NAME }
-                                                    .to_string(),
+                                                defined_file_name: current_file_name!(),
                                             });
                                             self.column += number.len() + underscores_length;
                                         }
@@ -1241,8 +1466,8 @@ impl Tokenizer {
                                     length: 1,
                                     line: self.line,
                                     col: self.column,
-                                    defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                    defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                                    defined_file: Some(current_file!()),
+                                    defined_file_name: current_file_name!(),
                                 });
                                 self.column += 1;
                             }
@@ -1252,8 +1477,8 @@ impl Tokenizer {
                                 length: 1,
                                 line: self.line,
                                 col: self.column,
-                                defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                                defined_file: Some(current_file!()),
+                                defined_file_name: current_file_name!(),
                             });
                             self.column += 1;
                         }
@@ -1266,8 +1491,8 @@ impl Tokenizer {
                                 length: 2,
                                 line: self.line,
                                 col: self.column,
-                                defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                                defined_file: Some(current_file!()),
+                                defined_file_name: current_file_name!(),
                             });
                             self.column += 2;
                         } else {
@@ -1276,8 +1501,8 @@ impl Tokenizer {
                                 length: 1,
                                 line: self.line,
                                 col: self.column,
-                                defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                                defined_file: Some(current_file!()),
+                                defined_file_name: current_file_name!(),
                             });
                             self.column += 1;
                         }
@@ -1290,8 +1515,8 @@ impl Tokenizer {
                                 length: 2,
                                 line: self.line,
                                 col: self.column,
-                                defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                                defined_file: Some(current_file!()),
+                                defined_file_name: current_file_name!(),
                             });
                             self.column += 2;
                         } else if let Some(&'/') = iter.peek() {
@@ -1311,8 +1536,8 @@ impl Tokenizer {
                                 length: 1,
                                 line: self.line,
                                 col: self.column,
-                                defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                                defined_file: Some(current_file!()),
+                                defined_file_name: current_file_name!(),
                             });
                             self.column += 1;
                         }
@@ -1323,8 +1548,8 @@ impl Tokenizer {
                             length: 1,
                             line: self.line,
                             col: self.column,
-                            defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                            defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                            defined_file: Some(current_file!()),
+                            defined_file_name: current_file_name!(),
                         });
                         self.column += 1;
                     }
@@ -1336,8 +1561,8 @@ impl Tokenizer {
                                 length: 2,
                                 line: self.line,
                                 col: self.column,
-                                defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                                defined_file: Some(current_file!()),
+                                defined_file_name: current_file_name!(),
                             });
                             self.column += 2;
                         } else {
@@ -1346,8 +1571,8 @@ impl Tokenizer {
                                 length: 1,
                                 line: self.line,
                                 col: self.column,
-                                defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                                defined_file: Some(current_file!()),
+                                defined_file_name: current_file_name!(),
                             });
                             self.column += 1;
                         }
@@ -1360,8 +1585,8 @@ impl Tokenizer {
                                 length: 2,
                                 line: self.line,
                                 col: self.column,
-                                defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                                defined_file: Some(current_file!()),
+                                defined_file_name: current_file_name!(),
                             });
                             self.column += 2;
                         } else {
@@ -1370,8 +1595,8 @@ impl Tokenizer {
                                 length: 1,
                                 line: self.line,
                                 col: self.column,
-                                defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                                defined_file: Some(current_file!()),
+                                defined_file_name: current_file_name!(),
                             });
                             self.column += 1;
                         }
@@ -1384,8 +1609,8 @@ impl Tokenizer {
                                 length: 2,
                                 line: self.line,
                                 col: self.column,
-                                defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                                defined_file: Some(current_file!()),
+                                defined_file_name: current_file_name!(),
                             });
                             self.column += 2;
                         } else {
@@ -1394,8 +1619,8 @@ impl Tokenizer {
                                 length: 1,
                                 line: self.line,
                                 col: self.column,
-                                defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                                defined_file: Some(current_file!()),
+                                defined_file_name: current_file_name!(),
                             });
                             self.column += 1;
                         }
@@ -1406,8 +1631,8 @@ impl Tokenizer {
                             length: 1,
                             line: self.line,
                             col: self.column,
-                            defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                            defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                            defined_file: Some(current_file!()),
+                            defined_file_name: current_file_name!(),
                         });
                         self.column += 1;
                     }
@@ -1418,8 +1643,8 @@ impl Tokenizer {
                             length: 2,
                             line: self.line,
                             col: self.column,
-                            defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                            defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                            defined_file: Some(current_file!()),
+                            defined_file_name: current_file_name!(),
                         });
                         self.column += 2;
                     }
@@ -1430,8 +1655,8 @@ impl Tokenizer {
                             length: 2,
                             line: self.line,
                             col: self.column,
-                            defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                            defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                            defined_file: Some(current_file!()),
+                            defined_file_name: current_file_name!(),
                         });
                         self.column += 2;
                     }
@@ -1442,8 +1667,8 @@ impl Tokenizer {
                             length: 2,
                             line: self.line,
                             col: self.column,
-                            defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                            defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                            defined_file: Some(current_file!()),
+                            defined_file_name: current_file_name!(),
                         });
                         self.column += 2;
                     }
@@ -1454,8 +1679,8 @@ impl Tokenizer {
                             length: 2,
                             line: self.line,
                             col: self.column,
-                            defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                            defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                            defined_file: Some(current_file!()),
+                            defined_file_name: current_file_name!(),
                         });
                         self.column += 2;
                     }
@@ -1465,8 +1690,8 @@ impl Tokenizer {
                             length: 1,
                             line: self.line,
                             col: self.column,
-                            defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                            defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                            defined_file: Some(current_file!()),
+                            defined_file_name: current_file_name!(),
                         });
                         self.column += 1;
                     }
@@ -1476,8 +1701,8 @@ impl Tokenizer {
                             length: 1,
                             line: self.line,
                             col: self.column,
-                            defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                            defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                            defined_file: Some(current_file!()),
+                            defined_file_name: current_file_name!(),
                         });
                         self.column += 1;
                     }
@@ -1487,8 +1712,8 @@ impl Tokenizer {
                             length: 1,
                             line: self.line,
                             col: self.column,
-                            defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                            defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                            defined_file: Some(current_file!()),
+                            defined_file_name: current_file_name!(),
                         });
                         self.column += 1;
                     }
@@ -1498,8 +1723,8 @@ impl Tokenizer {
                             length: 1,
                             line: self.line,
                             col: self.column,
-                            defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                            defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                            defined_file: Some(current_file!()),
+                            defined_file_name: current_file_name!(),
                         });
                         self.column += 1;
                     }
@@ -1509,8 +1734,8 @@ impl Tokenizer {
                             length: 1,
                             line: self.line,
                             col: self.column,
-                            defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                            defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                            defined_file: Some(current_file!()),
+                            defined_file_name: current_file_name!(),
                         });
                         self.column += 1;
                     }
@@ -1520,8 +1745,8 @@ impl Tokenizer {
                             length: 1,
                             line: self.line,
                             col: self.column,
-                            defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                            defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                            defined_file: Some(current_file!()),
+                            defined_file_name: current_file_name!(),
                         });
                         self.column += 1;
                     }
@@ -1531,8 +1756,8 @@ impl Tokenizer {
                             length: 1,
                             line: self.line,
                             col: self.column,
-                            defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                            defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                            defined_file: Some(current_file!()),
+                            defined_file_name: current_file_name!(),
                         });
                         self.column += 1;
                     }
@@ -1542,8 +1767,8 @@ impl Tokenizer {
                             length: 1,
                             line: self.line,
                             col: self.column,
-                            defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                            defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                            defined_file: Some(current_file!()),
+                            defined_file_name: current_file_name!(),
                         });
                         self.column += 1;
                     }
@@ -1557,8 +1782,8 @@ impl Tokenizer {
                                     length: 3,
                                     line: self.line,
                                     col: self.column,
-                                    defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                    defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                                    defined_file: Some(current_file!()),
+                                    defined_file_name: current_file_name!(),
                                 });
                                 self.column += 3;
                                 continue;
@@ -1576,8 +1801,8 @@ impl Tokenizer {
                             length: 1,
                             line: self.line,
                             col: self.column,
-                            defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                            defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                            defined_file: Some(current_file!()),
+                            defined_file_name: current_file_name!(),
                         });
                         self.column += 1;
                     }
@@ -1587,8 +1812,8 @@ impl Tokenizer {
                             length: 1,
                             line: self.line,
                             col: self.column,
-                            defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                            defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                            defined_file: Some(current_file!()),
+                            defined_file_name: current_file_name!(),
                         });
                         self.column += 1;
                     }
@@ -1599,8 +1824,8 @@ impl Tokenizer {
                             length: 2,
                             line: self.line,
                             col: self.column,
-                            defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                            defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                            defined_file: Some(current_file!()),
+                            defined_file_name: current_file_name!(),
                         });
                         self.column += 2;
                     }
@@ -1610,8 +1835,8 @@ impl Tokenizer {
                             length: 1,
                             line: self.line,
                             col: self.column,
-                            defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                            defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                            defined_file: Some(current_file!()),
+                            defined_file_name: current_file_name!(),
                         });
                         self.column += 1;
                     }
@@ -1637,7 +1862,8 @@ impl Tokenizer {
                         }
                         if [
                             "var", "return", "function", "while", "if", "else", "struct", "throw",
-                            "try", "catch", "class", "property", "builder", "extern", "as",
+                            "try", "catch", "class", "property", "builder", "extern", "as", "do",
+                            "unchecked_cast", "slice", "method", "static"
                         ]
                         .contains(&identifier.as_str())
                         {
@@ -1647,8 +1873,8 @@ impl Tokenizer {
                                 length,
                                 line: self.line,
                                 col: self.column,
-                                defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                                defined_file: Some(current_file!()),
+                                defined_file_name: current_file_name!(),
                             });
                             self.column += length;
                         } else if ["true", "false"].contains(&identifier.as_str()) {
@@ -1658,8 +1884,8 @@ impl Tokenizer {
                                 length,
                                 line: self.line,
                                 col: self.column,
-                                defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                                defined_file: Some(current_file!()),
+                                defined_file_name: current_file_name!(),
                             });
                             self.column += length;
                         } else if &identifier == "none" {
@@ -1668,13 +1894,23 @@ impl Tokenizer {
                                 length: 4,
                                 line: self.line,
                                 col: self.column,
-                                defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                                defined_file: Some(current_file!()),
+                                defined_file_name: current_file_name!(),
+                            });
+                            self.column += 4;
+                        } else if &identifier == "null" {
+                            self.tokens.push(Token {
+                                kind: TokenKind::Null,
+                                length: 4,
+                                line: self.line,
+                                col: self.column,
+                                defined_file: Some(current_file!()),
+                                defined_file_name: current_file_name!(),
                             });
                             self.column += 4;
                         } else if [
                             "i64", "i32", "i16", "i8", "u64", "u32", "u16", "u8", "f64", "f32",
-                            "string", "bool",
+                            "string", "bool", "opaqueptr"
                         ]
                         .contains(&identifier.as_str())
                         {
@@ -1692,6 +1928,7 @@ impl Tokenizer {
                                 "f32" => Type::F32,
                                 "string" => Type::String,
                                 "bool" => Type::Bool,
+                                "opaqueptr" => Type::OpaquePtr,
                                 _ => unreachable!(),
                             };
                             self.tokens.push(Token {
@@ -1699,8 +1936,8 @@ impl Tokenizer {
                                 length,
                                 line: self.line,
                                 col: self.column,
-                                defined_file: Some(unsafe { CURRENT_FILE.to_string() }),
-                                defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                                defined_file: Some(current_file!()),
+                                defined_file_name: current_file_name!(),
                             });
                             self.column += length;
                         } else {
@@ -1710,8 +1947,8 @@ impl Tokenizer {
                                 length,
                                 line: self.line,
                                 col: self.column,
-                                defined_file: Some(unsafe { &CURRENT_FILE }.to_string()),
-                                defined_file_name: unsafe { &CURRENT_FILE_NAME }.to_string(),
+                                defined_file: Some(current_file!()),
+                                defined_file_name: current_file_name!(),
                             });
                             self.column += length;
                         }

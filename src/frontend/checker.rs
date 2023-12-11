@@ -1,26 +1,43 @@
 use std::{
     collections::HashMap,
     error::Error,
-    fmt::{self, Display},
+    fmt::{self, Display}, io::BufWriter,
 };
 
-use crate::{frontend::ast::AccessModifier, untracked_mut};
+use crate::{frontend::ast::AccessModifier, untracked_mut, warningprintln};
 
 use super::{
     ast::{Class, DivType, Expression, Statement, StatementD},
-    tokens::{Token, Type as ForeignType},
+    tokens::{Token, Type as ForeignType, self},
 };
 
 #[derive(Debug, Clone)]
-pub struct CheckerError(pub Token, pub String, pub Vec<String>);
+pub struct CheckerError(pub Token, pub String, pub Vec<String>, pub Vec<FunctionData>);
 
 impl CheckerError {
     pub fn new<T: ToString>(location: Token, message: T) -> Self {
-        Self(location, message.to_string(), vec![])
+        Self(location, message.to_string(), vec![], vec![])
     }
 
     pub fn add_note<T: ToString>(&mut self, note: T) {
         self.2.push(note.to_string());
+    }
+
+    pub fn add_location(&mut self, location: FunctionData) {
+        self.3.push(location);
+    }
+}
+
+pub trait AddLocation {
+    fn with_location(self, location: FunctionData) -> Self;
+}
+
+impl<T> AddLocation for Result<T, CheckerError> {
+    fn with_location(mut self, location: FunctionData) -> Self {
+        if let Err(e) = &mut self {
+            e.add_location(location);
+        }
+        self
     }
 }
 
@@ -110,6 +127,7 @@ impl BuiltType {
             || matches!(self, BuiltType::I64)
             || matches!(self, BuiltType::F32)
             || matches!(self, BuiltType::F64)
+            || matches!(self, BuiltType::Bool)
     }
 
     pub fn is_signed_int(&self) -> bool {
@@ -124,14 +142,37 @@ impl BuiltType {
             || matches!(self, BuiltType::U16)
             || matches!(self, BuiltType::U32)
             || matches!(self, BuiltType::U64)
+            || matches!(self, BuiltType::Bool)
     }
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, Debug)]
 pub enum Type {
     Built(BuiltType),
     Class(String, Class),
+    OpaquePtr,
     SSelf,
+    Slice(Box<Type>),
+}
+
+impl PartialEq for Type {
+    fn eq(&self, other: &Self) -> bool {
+        if let Type::Built(bs) = self {
+            if let Type::Built(bo) = other {
+                return bs == bo;
+            } else {
+                return false;
+            }
+        } else if let Type::Slice(a) = self {
+            if let Type::Slice(b) = other {
+                return a == b;
+            } else {
+                return false;
+            }
+        }
+        matches!(self, Self::OpaquePtr) && matches!(other, Self::Built(BuiltType::PointerTo(_)))
+            || matches!(other, Self::OpaquePtr) && matches!(self, Self::Built(BuiltType::PointerTo(_))) || matches!(self, Self::OpaquePtr) && matches!(other, Self::OpaquePtr)
+    }
 }
 
 impl fmt::Display for Type {
@@ -139,7 +180,9 @@ impl fmt::Display for Type {
         match self {
             Type::Built(b) => write!(f, "{b}"),
             Type::SSelf => write!(f, "Self"),
+            Type::OpaquePtr => write!(f, "opaqueptr"),
             Type::Class(c, _) => write!(f, "{c}"),
+            Type::Slice(i) => write!(f, "[]{i}"),
         }
     }
 }
@@ -172,10 +215,38 @@ pub struct FunctionData {
     pub is_var_args: bool,
 }
 
+impl Display for FunctionData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "function {}", self.name)?;
+        write!(f, "(")?;
+        if !self.arguments_types.is_empty() {
+            if self.arguments_types.len() >= 2 {
+                for (argument_name, argument_type) in self.arguments_types[..(self.arguments_types.len() - 2)].iter() {
+                    write!(f, "{}: {}, ", argument_name, argument_type)?;
+                }
+            } else {
+                for (argument_name, argument_type) in self.arguments_types[..(self.arguments_types.len() - 1)].iter() {
+                    write!(f, "{}: {}, ", argument_name, argument_type)?;
+                }
+            }
+            if let Some(last) = self.arguments_types.last() {
+                write!(f, "{}: {}", last.0, last.1)?;
+            }
+            if self.is_var_args {
+                write!(f, ", ...")?;
+            }
+        } else if self.is_var_args {
+            write!(f, "...")?;
+        }
+        write!(f, "): {}", self.return_type)
+    }
+}
+
 #[derive(Clone, PartialEq, Debug)]
 pub struct StructData {
     pub name: String,
     pub fields: Vec<(String, Type)>,
+    pub methods: HashMap<String, FunctionData>,
     pub generic_types: HashMap<String, Option<TraitBounds>>,
     pub implements: Vec<String>,
 }
@@ -390,6 +461,12 @@ macro_rules! binary_operator_impl {
         let (y, y_may_throw, _) = $self.check_expression(&mut *$y, $location)?;
         $self.assert_implements(&x, $ope, $location)?;
         $self.assert_implements(&y, $ope, $location)?;
+        if (x != y) {
+            return Err(CheckerError::new(
+                $location.clone(),
+                format!("Cannot use `{}` with distinct types `{}` and `{}`", $ope, x, y)
+            ));
+        }
         Ok((x, x_may_throw || y_may_throw, false))
     }};
 }
@@ -413,6 +490,8 @@ impl<'vec> Checker<'vec> {
 
     pub fn make_token_type(&self, t: &Type, location: &Token) -> Result<ForeignType, CheckerError> {
         match t {
+            Type::Slice(t) => Ok(ForeignType::Slice(Box::new(self.make_token_type(&*t, location)?))),
+            Type::OpaquePtr => Ok(ForeignType::OpaquePtr),
             Type::Built(b) => match b {
                 BuiltType::Bool => Ok(ForeignType::Bool),
                 BuiltType::F32 => Ok(ForeignType::F32),
@@ -480,6 +559,12 @@ impl<'vec> Checker<'vec> {
 
     pub fn make_local_type(&mut self, t: &ForeignType) -> Result<Type, CheckerError> {
         match t {
+            ForeignType::Slice(i) => {
+                Ok(Type::Slice(Box::new(self.make_local_type(&*i)?)))
+            }
+            ForeignType::OpaquePtr => {
+                Ok(Type::OpaquePtr)
+            }
             ForeignType::Struct {
                 name,
                 fields,
@@ -551,6 +636,29 @@ impl<'vec> Checker<'vec> {
     ) -> Result<(bool, Option<Type>, Vec<StatementD>, bool), CheckerError> {
         let mut may_throw = false;
         match statemento {
+            Statement::StructMethodCall(struct_value, fn_signature, struct_name, method_name, args, all_time_record_id) => {
+                let (expr_type, ..) = self.check_expression(struct_value, location)?;
+                if let Type::Built(BuiltType::Struct {
+                    name,
+                    fields,
+                    packed
+                }) = expr_type {
+                    let struct_data = self.struct_data(&name, location)?;
+                    *struct_name = name;
+                    if let Some(function_data) = struct_data.methods.get(method_name) {
+                        let return_type = self.make_token_type(&function_data.return_type, location)?;
+                        let mut args = vec![];
+                        for argument in function_data.arguments_types.iter() {
+                            args.push((argument.0.clone(), self.make_token_type(&argument.1, location)?));
+                        }
+                        *fn_signature = (return_type, args, function_data.is_var_args, function_data.may_throw);
+                    } else {
+                        return Err(CheckerError::new(location.clone(), format!("The struct `{struct_name}` does not have a method named `{method_name}`")))
+                    }
+                } else {
+                    return Err(CheckerError::new(location.clone(), format!("Cannot use the struct method call operator on a `{expr_type}`")))
+                }
+            }
             Statement::ClassDeclaration(name, class) => {
                 for function in &class.functions {}
                 self.classes.insert(name.to_string(), class.clone());
@@ -560,18 +668,45 @@ impl<'vec> Checker<'vec> {
                 *struct_type = self.make_token_type(&variable_data.variable_type, location)?;
                 if let Type::Built(BuiltType::Struct { name, fields, packed }) = &variable_data.variable_type {
                     let field_index = fields.iter().position(|i| &i.0 == struct_field);
-                    if field_index.is_none() {
-                        return Err(CheckerError::new(location.clone(), format!("Struct `{name}` does not have a field named `{struct_field}`")))
-                    } else {
-                        let field_index = field_index.unwrap();
+                    if let Some(field_index) = field_index {
                         *index = field_index;
+                    } else {
+                        return Err(CheckerError::new(location.clone(), format!("Struct `{name}` does not have a field named `{struct_field}`")))
                     }
                 } else {
                     return Err(CheckerError::new(location.clone(), format!("Cannot assign to a field of a non-struct type {}", variable_data.variable_type)))
                 }
             }
-            Statement::VariableDeclaration(variable_name, expression) => {
+            Statement::StructFieldIndirectAssignment(variable_name, struct_field, expression, index, struct_type) => {
+                let variable_data = self.variable_data(variable_name, location)?.clone();
+                *struct_type = self.make_token_type(&variable_data.variable_type, location)?;
+                if let Type::Built(BuiltType::PointerTo(t)) = &variable_data.variable_type {
+                    if let Type::Built(BuiltType::Struct { name, fields, packed }) = &**t {
+                        let field_index = fields.iter().position(|i| &i.0 == struct_field);
+                        if let Some(field_index) = field_index {
+                            *index = field_index;
+                        } else {
+                            return Err(CheckerError::new(location.clone(), format!("Struct `{name}` does not have a field named `{struct_field}`")))
+                        }
+                    } else {
+                        return Err(CheckerError::new(location.clone(), format!("Cannot use the indirect struct field assignment operator with a non pointer-to-struct type  {}", variable_data.variable_type)))
+                    }
+                } else {
+                    return Err(CheckerError::new(location.clone(), format!("Cannot use the indirect struct field assignment operator with a non pointer type {}", variable_data.variable_type)))
+                }
+            }
+            Statement::VariableDeclaration(variable_name, optional_specified_type, expression) => {
                 let (expression_type, throws, can_be_referenced) = self.check_expression(expression, location)?;
+                if let Some(token_specified_type) = optional_specified_type {
+                    let specified_type = self.make_local_type(&token_specified_type)?;
+                    if specified_type != expression_type {
+                        eprintln!("{specified_type:?} != {expression_type:?}");
+                        return Err(CheckerError::new(
+                            location.clone(),
+                            format!("Variable `{variable_name}` has its type specified as `{specified_type}` but the expression it was assigned to has the type `{expression_type}`")
+                        ));
+                    }
+                }
                 if self.current_scope(|scope| scope.is_global) {
                     return Err(CheckerError::new(
                         location.clone(),
@@ -712,7 +847,7 @@ impl<'vec> Checker<'vec> {
 
                 while let Some(statement) = block.get_mut(i) {
                     let (stopped, _optional_t, mut drop_glue, throws) =
-                        self.check_statement(&mut statement.1, location)?;
+                        self.check_statement(&mut statement.1, &statement.0.clone())?;
                     may_throw |= throws;
                     if !has_ever_stopped {
                         has_ever_stopped = stopped;
@@ -735,6 +870,7 @@ impl<'vec> Checker<'vec> {
                     StructData {
                         name: struct_name.to_string(),
                         fields,
+                        methods: HashMap::new(),
                         generic_types: HashMap::new(),
                         implements: vec![],
                     },
@@ -802,9 +938,104 @@ impl<'vec> Checker<'vec> {
                 self.check_statement(&mut try_block.1, location)?;
                 self.check_statement(&mut catch_block.1, location)?;
             }
-            _ => unimplemented!("{:?}", statemento),
+            Statement::DoWhile(do_block, while_condition) => {
+                self.check_statement(&mut do_block.1, location)?;
+                self.check_expression(while_condition, location)?;
+            }
+            Statement::DropGlue(_) => panic!("DropGlue is not used but has not yet been removed"),
+            Statement::SysDefReturn(_) => {},
+            Statement::NamespaceDeclaration(..) => panic!("namespaces are not used but have not yet been removed"),
+            Statement::StructMethodDefinition(struct_name, method_name, signature, function_body, this_type) => {
+                self.struct_method_definition(struct_name, method_name, signature, function_body, this_type, location)?;
+            }
         }
         Ok((false, None, vec![], may_throw))
+    }
+
+    fn struct_method_definition(&mut self, struct_name: &mut String, method_name: &mut String, signature: &mut (tokens::Type, Vec<(String, tokens::Type)>, bool, bool), function_body: &mut Vec<(Token, Statement)>, this_type: &mut tokens::Type, location: &Token) -> Result<(), CheckerError> {
+        let mut variables = HashMap::new();
+        let mut struct_data = self.struct_data(struct_name, location)?;
+        let this_type_for_data = Type::Built(BuiltType::PointerTo(Box::new(Type::Built(BuiltType::Struct { name: struct_name.clone(), fields: struct_data.fields.clone(), packed: false }))));
+        *this_type = self.make_token_type(&this_type_for_data, location)?;
+        variables.insert(
+            "this".to_string(),
+            VariableData {
+                variable_type: this_type_for_data,
+                was_moved: false,
+            }
+        );
+        for (argument_name, argument_type) in signature.1.iter() {
+            variables.insert(
+                argument_name.to_string(),
+                VariableData {
+                    variable_type: self.make_local_type(argument_type)?,
+                    was_moved: false,
+                },
+            );
+        }
+        let mut new_arguments = vec![];
+        let return_typee = self.make_local_type(&signature.0)?;
+        signature.0 = self.make_token_type(&return_typee, location)?;
+        for arg in signature.1.iter_mut() {
+            let arg_local = self.make_local_type(&arg.1)?;
+            arg.1 = self.make_token_type(&arg_local, location)?;
+            new_arguments.push((arg.0.clone(), arg_local));
+        }
+        let len = self.scopes.len();
+        
+        let mut function_data = FunctionData {
+            name: format!("{struct_name}::{method_name}"),
+            return_type: return_typee.clone(),
+            generic_types: HashMap::new(),
+            arguments_types: new_arguments.clone(),
+            takes_in_self: None,
+            may_throw: false,
+            is_var_args: signature.3,
+        };
+
+        self.all_time_functions.insert((len, format!("{struct_name}::{method_name}")), function_data.clone());
+        function_data.name = method_name.to_string();
+        let statements = function_body;
+        self.scopes.push(Scope::function_new());
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.local_variables = variables;
+        }
+        let mut has_ever_stopped = false;
+        let mut i = 0;
+        while let Some(statement) = statements.get_mut(i) {
+            let (stopped, optional_t, drop_glue, throws) =
+                self.check_statement(&mut statement.1, &statement.0.clone()).with_location(FunctionData {
+                    name: format!("{struct_name}::{method_name}"),
+                    return_type: return_typee.clone(),
+                    generic_types: HashMap::new(),
+                    arguments_types: new_arguments.clone(),
+                    takes_in_self: None,
+                    may_throw: false,
+                    is_var_args: signature.3,
+                })?;
+            signature.2 |= throws;
+            if !has_ever_stopped {
+                has_ever_stopped = stopped;
+            }
+            statements.splice(i..i, drop_glue.into_iter());
+            if let Some(t) = optional_t {
+                if t != self.make_local_type(&signature.0)? {
+                    return Err(CheckerError::new(location.clone(), format!("The function `{struct_name}::{method_name}` was expected to return {} but it returned {t}", signature.0)));
+                }
+            }
+            i += 1;
+        }
+        if !has_ever_stopped {
+            if signature.0 != ForeignType::None {
+                return Err(CheckerError::new(location.clone(), format!("Function `{struct_name}::{method_name}` does not return anything but is declared with a return type of `{}`", signature.0)))
+            } else {
+                statements.push((statements.last().map(|s| s.0.clone()).unwrap_or(location.clone()), Statement::ReturnVoid));
+            }
+            self.close_block(location)?;
+        }
+        struct_data.methods.insert(method_name.to_string(), function_data);
+        self.modify_struct_data(struct_name, struct_data, location)?;
+        Ok(())
     }
 
     fn function_definition(
@@ -856,9 +1087,9 @@ impl<'vec> Checker<'vec> {
         }
         self.all_time_functions.insert((len, name.to_string()), FunctionData {
             name: name.to_string(),
-            return_type: return_typee,
+            return_type: return_typee.clone(),
             generic_types: HashMap::new(),
-            arguments_types: new_arguments,
+            arguments_types: new_arguments.clone(),
             takes_in_self: None,
             may_throw: false,
             is_var_args,
@@ -872,7 +1103,15 @@ impl<'vec> Checker<'vec> {
             let mut i = 0;
             while let Some(statement) = statements.get_mut(i) {
                 let (stopped, optional_t, drop_glue, throws) =
-                    self.check_statement(&mut statement.1, location)?;
+                    self.check_statement(&mut statement.1, &statement.0.clone()).with_location(FunctionData {
+                        name: name.to_string(),
+                        return_type: return_typee.clone(),
+                        generic_types: HashMap::new(),
+                        arguments_types: new_arguments.clone(),
+                        takes_in_self: None,
+                        may_throw: false,
+                        is_var_args,
+                    })?;
                 *may_throw |= throws;
                 if !has_ever_stopped {
                     has_ever_stopped = stopped;
@@ -926,6 +1165,54 @@ impl<'vec> Checker<'vec> {
         location: &Token,
     ) -> Result<(Type, bool, bool), CheckerError> {
         match expression {
+            Expression::StructMethodCall(struct_value, fn_signature, struct_name, method_name, args, all_time_record_id) => {
+                let (expr_type, ..) = self.check_expression(struct_value, location)?;
+                if let Type::Built(BuiltType::Struct {
+                    name,
+                    fields,
+                    packed
+                }) = expr_type {
+                    let struct_data = self.struct_data(&name, location)?;
+                    *struct_name = name;
+                    if let Some(function_data) = struct_data.methods.get(method_name) {
+                        let return_type = self.make_token_type(&function_data.return_type, location)?;
+                        let mut args = vec![];
+                        for argument in function_data.arguments_types.iter() {
+                            args.push((argument.0.clone(), self.make_token_type(&argument.1, location)?));
+                        }
+                        *fn_signature = (return_type, args, function_data.is_var_args, function_data.may_throw);
+                        Ok((function_data.return_type.clone(), false, false))
+                    } else {
+                        Err(CheckerError::new(location.clone(), format!("The struct `{struct_name}` does not have a method named `{method_name}`")))
+                    }
+                } else {
+                    Err(CheckerError::new(location.clone(), format!("Cannot use the struct method call operator on a `{expr_type}`")))
+                }
+            }
+            Expression::List(values, t) => {
+                if values.is_empty() {
+                    Err(CheckerError::new(location.clone(), "Empty lists are not allowed, cannot allocate zero bytes"))
+                } else {
+                    let first_value_expr = self.check_expression(values.first_mut().unwrap(), location)?;
+                    *t = self.make_token_type(&first_value_expr.0, location)?;
+                    if values.len() > 1 {
+                        for value in &mut values[1..] {
+                            let expr = self.check_expression(value, location)?;
+                            if expr.0 != first_value_expr.0 {
+                                return Err(CheckerError::new(location.clone(), format!("Slice type was expected to be `{}` but was found to be `{}`", first_value_expr.0, expr.0)))
+                            }
+                        }
+                    }
+                    Ok((Type::Slice(Box::new(first_value_expr.0)), false, false))
+                }
+            }
+            Expression::NullPointer => {
+                Ok((Type::OpaquePtr, false, false))
+            }
+            Expression::UncheckedCast(f, to) => {
+                let r = self.check_expression(f, location)?;
+                Ok((self.make_local_type(to)?, r.1, false))
+            },
             Expression::Eq(l, r, lt, rt) | Expression::Ne(l, r, lt, rt)
             | Expression::Lt(l, r, lt, rt) | Expression::Le(l, r, lt, rt)
             | Expression::Gt(l, r, lt, rt) | Expression::Ge(l, r, lt, rt) => {
@@ -943,7 +1230,7 @@ impl<'vec> Checker<'vec> {
                     }
                     Ok((Type::Built(BuiltType::Bool), left.1 || right.1, false))
                 } else {
-                    Err(CheckerError::new(location.clone(), "Cannot compare different types".to_string()))
+                    Err(CheckerError::new(location.clone(), "Cannot compare distinct types".to_string()))
                 }
             }
             Expression::Reference(expr, to) => {
@@ -970,6 +1257,27 @@ impl<'vec> Checker<'vec> {
                     Err(CheckerError::new(location.clone(), format!("Cannot access a field of a non-struct type: {expr_type}")))
                 }
             }
+            Expression::IndirectStructAccess(expr, field_name, index, tt, struct_type) => {
+                let (expr_type, throws, can_be_referenced) = self.check_expression(expr, location)?;
+                if let Type::Built(BuiltType::PointerTo(inner_t)) = expr_type.clone() {
+                    if let Type::Built(BuiltType::Struct { name, fields, packed }) = *inner_t.clone() {
+                        if let Some((index_found, (_, field_type))) = fields.iter().enumerate().find(|field| &field.1.0 == field_name) {
+                            *index = index_found;
+                            *tt = self.make_token_type(field_type, location)?;
+                            *struct_type = self.make_token_type(&inner_t, location)?;
+                            Ok((field_type.clone(), throws, false))
+                        } else {
+                            Err(CheckerError::new(location.clone(), format!("The struct `{name}` does not have a field named `{field_name}`")))
+                        }
+                    } else {
+                        Err(CheckerError::new(location.clone(), format!("Cannot access a field of an inner non-struct type: {expr_type}")))
+                    }
+                } else {
+                    Err(CheckerError::new(location.clone(), format!("Cannot use the indirect access operator on a non-pointer type: {expr_type}")))
+                }
+            }
+            // name: &mut String
+            // fields: &mut Vec<(String, Expression)>
             Expression::StructInstantiate(name, fields) => {
                 let struct_data = self.struct_data(name, location)?;
                 let mut ordered_fields = vec![];
@@ -997,11 +1305,19 @@ impl<'vec> Checker<'vec> {
             }
             Expression::TypeCast(expr, ffrom, to) => {
                 let (from, throws, can_be_referenced) = self.check_expression(expr, location)?;
-                if matches!(from, Type::Built(BuiltType::PointerTo(_))) && matches!(to, crate::frontend::tokens::Type::PointerTo(_))
-                    || &self.make_token_type(&from, location)? == to {
+                if (matches!(from, Type::Built(BuiltType::PointerTo(_))) && matches!(to, crate::frontend::tokens::Type::PointerTo(_))
+                        || &self.make_token_type(&from, location)? == to)
+                    || (matches!(from, Type::Built(BuiltType::PointerTo(_))) && matches!(to, crate::frontend::tokens::Type::OpaquePtr)
+                        || &self.make_token_type(&from, location)? == to) {
                         let local_to_type = self.make_local_type(to)?;
                         *expression = *expr.clone();
                         Ok((local_to_type, throws, false))
+                } else if matches!(from, Type::OpaquePtr) && matches!(to, crate::frontend::tokens::Type::PointerTo(_))
+                || &self.make_token_type(&from, location)? == to {
+                    warningprintln!("{}:{}:{}: Casting from `opaqueptr` to `{}` may not be safe", location.defined_file_name, location.line, location.col, to);
+                    let local_to_type = self.make_local_type(to)?;
+                    *expression = *expr.clone();
+                    Ok((local_to_type, throws, false))
                 } else {
                     *ffrom = self.make_token_type(&from, location)?;
                     let from_tokens_type = self.make_token_type(&from, location)?;
@@ -1035,6 +1351,11 @@ impl<'vec> Checker<'vec> {
                 if let Type::Built(BuiltType::PointerTo(to_type)) = to_t {
                     *tt = self.make_token_type(&to_type, location)?;
                     Ok((*to_type, can_throw, false))
+                } else if let Type::OpaquePtr = to_t {
+                    Err(CheckerError::new(
+                        location.clone(),
+                        format!("Cannot dereference `opaqueptr` because the type of the value it points to is not known at compile time")
+                    ))
                 } else {
                     Err(CheckerError::new(
                         location.clone(),
@@ -1073,8 +1394,18 @@ impl<'vec> Checker<'vec> {
             Expression::Multiplication(x, y) => {
                 binary_operator_impl!(self, location, x, y, "Mul")
             }
-            Expression::Division(x, y, other) => {
+            Expression::And(x, y) => {
+                binary_operator_impl!(self, location, x, y, "And")
+            }
+            Expression::Or(x, y) => {
+                binary_operator_impl!(self, location, x, y, "Or")
+            }
+            Expression::Xor(x, y) => {
+                binary_operator_impl!(self, location, x, y, "Xor")
+            }
+            Expression::Division(x, y, other, ot) => {
                 let (x, x_may_throw, _) = self.check_expression(x, location)?;
+                *ot = self.make_token_type(&x.clone(), location)?;
                 if let Type::Built(ref b) = x {
                     if b.is_signed_int() {
                         *other = DivType::SignedInt
@@ -1114,8 +1445,47 @@ impl<'vec> Checker<'vec> {
                     ))
                 }
             }
-            Expression::Remainder(x, y, _) => {
-                binary_operator_impl!(self, location, x, y, "Rem")
+            Expression::Remainder(x, y, other, ot) => {
+                let (x, x_may_throw, _) = self.check_expression(x, location)?;
+                *ot = self.make_token_type(&x.clone(), location)?;
+                if let Type::Built(ref b) = x {
+                    if b.is_signed_int() {
+                        *other = DivType::SignedInt
+                    } else if b.is_unsigned_int() {
+                        *other = DivType::UnsignedInt
+                    } else {
+                        *other = DivType::Float
+                    }
+                }
+                let (y, y_may_throw, _) = self.check_expression(y, location)?;
+                self.assert_implements(&x, "Rem", location)?;
+                if let Type::Built(BuiltType::PointerTo(ref yinner)) = y {
+                    if **yinner == x {
+                        Ok((x, x_may_throw || y_may_throw, false))
+                    } else {
+                        Err(CheckerError::new(
+                            location.clone(),
+                            format!(
+                                "Candidate types are not qualified for `{}`: {} and {}",
+                                "Rem", x, y
+                            ),
+                        ))
+                    }
+                } else if x == y {
+                    if matches!(x, Type::Built(_)) {
+                        Ok((x, x_may_throw || y_may_throw, false))
+                    } else {
+                        Err(CheckerError::new(location.clone(), format!("Non-builtin types like {} must have their right operand passed by reference to {}", x, "Rem")))
+                    }
+                } else {
+                    Err(CheckerError::new(
+                        location.clone(),
+                        format!(
+                            "Candidate types are not qualified for `{}`: {} and {}",
+                            "Rem", x, y
+                        ),
+                    ))
+                }
             }
             Expression::Call(signature, function_name, arguments, all_time_record_id) => {
                 let (function, record_id) = self.function_data(function_name, location)?;
@@ -1173,7 +1543,7 @@ impl<'vec> Checker<'vec> {
     ) -> Result<(), CheckerError> {
         match type_to {
             Type::Built(b) if b.is_numeric() => {
-                if ["Add", "Sub", "Mul", "Div", "Rem"].contains(&trait_) {
+                if ["Add", "Sub", "Mul", "Div", "Rem", "And", "Or", "Xor"].contains(&trait_) {
                     Ok(())
                 } else {
                     Err(CheckerError::new(
@@ -1270,6 +1640,26 @@ impl<'vec> Checker<'vec> {
         for scope in self.scopes.iter().rev() {
             if let Some(data) = scope.local_structs.get(struct_name).cloned() {
                 return Ok(data);
+            } else {
+                continue;
+            }
+        }
+        Err(CheckerError::new(
+            location.clone(),
+            format!("Struct `{struct_name}` not found at the current scope"),
+        ))
+    }
+
+    pub fn modify_struct_data(
+        &mut self,
+        struct_name: &str,
+        with: StructData,
+        location: &Token,
+    ) -> Result<(), CheckerError> {
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(data) = scope.local_structs.get_mut(struct_name) {
+                *data = with;
+                return Ok(());
             } else {
                 continue;
             }

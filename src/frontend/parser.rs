@@ -8,8 +8,8 @@ use std::{collections::HashMap, error::Error, fmt::Display, vec::IntoIter};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParseError {
-    location: Token,
-    message: String,
+    pub location: Token,
+    pub message: String,
 }
 
 macro_rules! op_parse_impl {
@@ -28,7 +28,7 @@ impl ParseError {
 
 impl Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
+        write!(f, "{}:{}:{}: {}\n{}", self.location.defined_file_name, self.location.line, self.location.length, self.message, self.location.defined_file.clone().unwrap_or("".to_owned()).lines().nth(self.location.line).unwrap_or(""))
     }
 }
 
@@ -65,12 +65,19 @@ impl Parser {
                         match kw.as_str() {
                             "var" => {
                                 let variable_name = self.expect_identifier()?;
+                                let optional_type;
+                                if matches!(self.peek_token().map(|t| t.kind), Some(TokenKind::Colon)) {
+                                    self.next_token();
+                                    optional_type = Some(self.parse_type()?);
+                                } else {
+                                    optional_type = None;
+                                }
                                 self.expect_token(TokenKind::Equals)?;
                                 let expression = self.parse_expression()?;
                                 self.expect_token(TokenKind::Semicolon)?;
                                 Ok(Some((
                                     token,
-                                    Statement::VariableDeclaration(variable_name, expression),
+                                    Statement::VariableDeclaration(variable_name, optional_type, expression),
                                 )))
                             }
                             "return" => {
@@ -170,13 +177,28 @@ impl Parser {
                                 self.expect_token(TokenKind::RightParen)?;
                                 let statement = self.parse_statement()?;
                                 match statement {
-                            Some(statement) => {
-                                Ok(Some((token, Statement::While(condition, Box::new(statement)))))
+                                    Some(statement) => {
+                                        Ok(Some((token, Statement::While(condition, Box::new(statement)))))
+                                    }
+                                    None => {
+                                        Err(ParseError::new(token.clone(), "Expected a valid statement for the while loop but found `EOF`".to_string()))
+                                    }
+                                }
                             }
-                            None => {
-                                Err(ParseError::new(token.clone(), "Expected a valid statement for the while loop but found `EOF`".to_string()))
-                            }
-                        }
+                            "do" => {
+                                let statement = self.parse_statement()?;
+                                self.expect_token(TokenKind::Keyword("while".to_string()))?;
+                                self.expect_token(TokenKind::LeftParen)?;
+                                let condition = self.parse_expression()?;
+                                self.expect_token(TokenKind::RightParen)?;
+                                match statement {
+                                    Some(statement) => {
+                                        Ok(Some((token, Statement::DoWhile(Box::new(statement), condition))))
+                                    }
+                                    None => {
+                                        Err(ParseError::new(token.clone(), "Expected a valid statement for the do while loop but found `EOF`".to_string()))
+                                    }
+                                }
                             }
                             "if" => {
                                 self.expect_token(TokenKind::LeftParen)?;
@@ -245,12 +267,16 @@ impl Parser {
                                     )),
                                 }
                             }
-                            "class" => {
-                                let class_name = self.expect_identifier()?;
-                                let class = self.parse_class()?;
+                            "method" => {
+                                let struct_name = self.expect_identifier()?;
+                                self.expect_token(TokenKind::DoubleColon)?;
+                                let method_name = self.expect_identifier()?;
+                                let (arguments, is_var_args) = self.parse_method_function_arguments()?;
+                                let return_type = self.parse_return_type()?;
+                                let block = self.parse_block(true)?;
                                 Ok(Some((
                                     token,
-                                    Statement::ClassDeclaration(class_name, class),
+                                    Statement::StructMethodDefinition(struct_name, method_name, (return_type, arguments, false, is_var_args), block, Type::None)
                                 )))
                             }
                             _ => unimplemented!(),
@@ -263,6 +289,22 @@ impl Parser {
                     TokenKind::Ident(i) => {
                         let token_symb = self.must_next_token()?;
                         match &token_symb.kind {
+                            TokenKind::DoubleColon => {
+                                let method_name = self.expect_identifier()?;
+                                let arguments = self.parse_arguments()?;
+                                self.expect_token(TokenKind::Semicolon)?;
+                                // (struct_value, fn_signature, struct_name, method_name, args, all_time_record_id)
+                                Ok(Some((
+                                    token.clone(),
+                                    Statement::StructMethodCall(
+                                        Box::new(Expression::Variable(i.to_string())),
+                                        (Type::None, vec![], false, false), String::new(),
+                                        method_name,
+                                        arguments,
+                                        0
+                                    )
+                                )))
+                            }
                             TokenKind::Equals => {
                                 let expression = self.parse_expression()?;
                                 self.expect_token(TokenKind::Semicolon)?;
@@ -291,13 +333,21 @@ impl Parser {
                                 let i = i.to_string();
                                 Ok(Some((token, Statement::StructFieldAssignment(i, field, expression, 0, Type::None))))
                             }
+                            TokenKind::PtrAccess => {
+                                let field = self.expect_identifier()?;
+                                self.expect_token(TokenKind::Equals)?;
+                                let expression = self.parse_expression()?;
+                                self.expect_token(TokenKind::Semicolon)?;
+                                let i = i.to_string();
+                                Ok(Some((token, Statement::StructFieldIndirectAssignment(i, field, expression, 0, Type::None))))
+                            }
                             _ => Err(ParseError::new(
                                 token_symb,
                                 "This token was not expected after an identifier".to_string(),
                             )),
                         }
                     }
-                    _ => unimplemented!("{:?}", token.kind),
+                    _ => Err(ParseError::new(token, "Unexpected token for a statement".to_string())),
                 }
             }
             None => Ok(None),
@@ -400,6 +450,58 @@ impl Parser {
         let mut va_args = false;
 
         self.expect_token(TokenKind::LeftParen)?;
+        loop {
+            if let Some(Token {
+                kind: TokenKind::RightParen,
+                ..
+            }) = self.peek_token()
+            {
+                self.next_token();
+                break;
+            }
+
+            let token = self.must_next_token()?;
+            match token.kind {
+                TokenKind::Ident(argument_name) => {
+                    self.expect_token(TokenKind::Colon)?;
+                    let argument_type = self.parse_type()?;
+                    arguments.push((argument_name, argument_type));
+                }
+                TokenKind::Ellipsis => {
+                    va_args = true;
+                    self.expect_token(TokenKind::RightParen)?;
+                    break;
+                }
+                _ => {
+                    let token_kind = token.kind.clone();
+                    return Err(ParseError::new(token, format!("Unexpected token for an arguments definition: {token_kind}")))
+                }
+            }
+
+            if let Some(Token {
+                kind: TokenKind::RightParen,
+                ..
+            }) = self.peek_token()
+            {
+                self.next_token();
+                break;
+            }
+
+            self.expect_token(TokenKind::Comma)?;
+        }
+
+        Ok((arguments, va_args))
+    }
+
+    pub fn parse_method_function_arguments(&mut self) -> Result<(Vec<(String, Type)>, bool), ParseError> {
+        let mut arguments = vec![];
+        let mut va_args = false;
+
+        self.expect_token(TokenKind::LeftParen)?;
+        self.expect_token(TokenKind::Ident("this".to_string()))?;
+        if self.peek_token().map(|t| t.kind == TokenKind::Comma).unwrap_or(false) {
+            self.next_token();
+        }
         loop {
             if let Some(Token {
                 kind: TokenKind::RightParen,
@@ -622,6 +724,27 @@ impl Parser {
     pub fn parse_term(&mut self) -> anyhow::Result<Expression, ParseError> {
         let token = self.must_next_token()?;
         match token.kind {
+            TokenKind::LeftBrac => {
+                let mut values = vec![];
+                loop {
+                    if matches!(self.peek_token(), Some(Token { kind: TokenKind::RightBrac, .. })) {
+                        self.next_token();
+                        break;
+                    }
+                    let expression = self.parse_expression()?;
+                    values.push(expression);
+                    if matches!(self.peek_token(), Some(Token { kind: TokenKind::Comma, .. })) {
+                        self.next_token();
+                    } else {
+                        self.expect_token(TokenKind::RightBrac)?;
+                        break;
+                    }
+                }
+                Ok(Expression::List(values, Type::None))
+            }
+            TokenKind::Null => {
+                Ok(Expression::NullPointer)
+            }
             TokenKind::Int(i, ref t) => match t {
                 Type::I8 => Ok(Expression::NumberI8(
                     <i64 as TryInto<i8>>::try_into(i)
@@ -654,6 +777,9 @@ impl Parser {
                 )),
                 _ => unreachable!(),
             },
+            TokenKind::Char(c) => {
+                Ok(Expression::NumberU32(c))
+            }
             TokenKind::String(s) => Ok(Expression::String(s)),
             TokenKind::Ident(i) => {
                 if self
@@ -684,6 +810,14 @@ impl Parser {
                 self.expect_token(TokenKind::RightParen)?;
                 Ok(expr)
             }
+            TokenKind::Keyword(kw) if kw.as_str() == "unchecked_cast" => {
+                self.expect_token(TokenKind::LeftParen)?;
+                let e = self.parse_expression()?;
+                self.expect_token(TokenKind::Comma)?;
+                let dst = self.parse_type()?;
+                self.expect_token(TokenKind::RightParen)?;
+                Ok(Expression::UncheckedCast(Box::new(e), dst))
+            }
             _ => {
                 let token_kind = token.kind.clone();
                 Err(ParseError::new(
@@ -699,6 +833,13 @@ impl Parser {
         let mut expression = self.parse_term()?;
         while let Some(t) = self.peek_token() {
             match t.kind {
+                TokenKind::DoubleColon => {
+                    self.next_token();
+                    let method_name = self.expect_identifier()?;
+                    let arguments = self.parse_arguments()?;
+                    // (struct_value, fn_signature, struct_name, method_name, args, all_time_record_id)
+                    expression = Expression::StructMethodCall(Box::new(expression), (Type::None, vec![], false, false), String::new(), method_name, arguments, 0);
+                }
                 TokenKind::Plus => {
                     op_parse_impl!(self, expression, Addition);
                 }
@@ -715,6 +856,7 @@ impl Parser {
                         Box::new(expression),
                         Box::new(rhs),
                         DivType::SignedInt,
+                        Type::None
                     );
                 }
                 TokenKind::Percent => {
@@ -724,6 +866,7 @@ impl Parser {
                         Box::new(expression),
                         Box::new(rhs),
                         DivType::SignedInt,
+                        Type::None
                     );
                 }
                 TokenKind::EqualTo => {
@@ -806,7 +949,26 @@ impl Parser {
                         Type::None,
                     );
                 }
-                
+                TokenKind::PtrAccess => {
+                    self.next_token();
+                    let field = self.expect_identifier()?;
+                    expression = Expression::IndirectStructAccess(
+                        Box::new(expression),
+                        field,
+                        0,
+                        Type::None,
+                        Type::None,
+                    );
+                }
+                TokenKind::MathAnd | TokenKind::LogicalAnd => {
+                    op_parse_impl!(self, expression, And);
+                }
+                TokenKind::MathOr | TokenKind::LogicalOr => {
+                    op_parse_impl!(self, expression, And);
+                }
+                TokenKind::LogicalXor => {
+                    op_parse_impl!(self, expression, Xor);
+                }
                 _ => break,
             }
         }
@@ -823,6 +985,9 @@ impl Parser {
                 fields: vec![],
                 packed: false,
             }),
+            TokenKind::Keyword(kw) if kw.as_str() == "slice" => {
+                Ok(Type::Slice(Box::new(self.parse_type()?)))
+            }
             TokenKind::None => Ok(Type::None),
             TokenKind::Times => Ok(Type::PointerTo(Box::new(self.parse_type()?))),
             _ => Err(ParseError::new(

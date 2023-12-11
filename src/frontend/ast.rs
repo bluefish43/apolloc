@@ -1,6 +1,8 @@
 use std::{collections::HashMap, str::FromStr};
 
-use super::tokens::{Token, Type};
+use crate::backend::llvm;
+
+use super::{tokens::{Token, Type}, checker};
 
 pub type BExpression = Box<Expression>;
 
@@ -32,12 +34,13 @@ pub struct Class {
 pub enum Statement {
     NamespaceDeclaration(String, Namespace),
     ClassDeclaration(String, Class),
-    VariableDeclaration(String, Expression),
+    VariableDeclaration(String, Option<Type>, Expression),
     Assignment(String, Expression),
     FunctionDeclaration(String, FunctionSignature, CallingConvention),
     FunctionDefinition(String, FunctionSignature, Vec<StatementD>, CallingConvention),
     IfElse(Expression, Box<StatementD>, Option<Box<StatementD>>),
     While(Expression, Box<StatementD>),
+    DoWhile(Box<StatementD>, Expression),
     Call(FunctionSignature, String, Vec<Expression>, usize),
     Return(Expression),
     ReturnVoid,
@@ -48,6 +51,9 @@ pub enum Statement {
     Throw(Expression),
     SysDefReturn(Expression),
     StructFieldAssignment(String, String, Expression, usize, Type),
+    StructFieldIndirectAssignment(String, String, Expression, usize, Type),
+    StructMethodDefinition(String, String, FunctionSignature, Vec<StatementD>, Type),
+    StructMethodCall(BExpression, FunctionSignature, String, String, Vec<Expression>, usize),
 }
 
 pub type StatementD = (Token, Statement);
@@ -61,8 +67,11 @@ pub enum DivType {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expression {
+    List(Vec<Expression>, Type),
+    UncheckedCast(BExpression, Type),
     Reference(BExpression, String),
     StructFieldAccess(BExpression, String, usize, Type, Type),
+    IndirectStructAccess(BExpression, String, usize, Type, Type),
     New(String, Vec<Expression>),
     Deref(Box<Expression>, Type),
     Variable(String),
@@ -80,16 +89,21 @@ pub enum Expression {
     Addition(BExpression, BExpression),
     Subtraction(BExpression, BExpression),
     Multiplication(BExpression, BExpression),
-    Division(BExpression, BExpression, DivType),
-    Remainder(BExpression, BExpression, DivType),
+    Division(BExpression, BExpression, DivType, Type),
+    Remainder(BExpression, BExpression, DivType, Type),
     Eq(BExpression, BExpression, Type, Type),
     Ne(BExpression, BExpression, Type, Type),
     Lt(BExpression, BExpression, Type, Type),
     Le(BExpression, BExpression, Type, Type),
     Gt(BExpression, BExpression, Type, Type),
     Ge(BExpression, BExpression, Type, Type),
+    And(BExpression, BExpression),
+    Or(BExpression, BExpression),
+    Xor(BExpression, BExpression),
     TypeCast(BExpression, Type, Type),
     StructInstantiate(String, Vec<(String, Expression)>),
+    NullPointer,
+    StructMethodCall(BExpression, FunctionSignature, String, String, Vec<Expression>, usize),
 }
 
 #[allow(clippy::upper_case_acronyms, non_camel_case_types)]

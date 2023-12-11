@@ -1,7 +1,9 @@
 #![allow(dead_code)]
 
-static mut CURRENT_FILE: &str = "";
-static mut CURRENT_FILE_NAME: &str = "default.ap";
+use memcmc::{iou, cell::{CellInterface, IoUCell}};
+
+static CURRENT_FILE: IoUCell<String> = unsafe { iou!("".to_string()) };
+static CURRENT_FILE_NAME: IoUCell<String> = unsafe { iou!("default.ap".to_string()) };
 
 mod backend;
 mod frontend;
@@ -9,6 +11,7 @@ mod frontend;
 extern crate llvm_sys;
 
 use std::process::ExitCode;
+use std::process::abort;
 use std::ptr::null_mut;
 
 use ansi_term::Color;
@@ -22,6 +25,8 @@ use clap::Command;
 use clap::FromArgMatches;
 use clap::Parser;
 use frontend::checker::Checker;
+use frontend::checker::CheckerError;
+use frontend::parser::ParseError;
 use frontend::tokens::Tokenizer;
 use libc::{signal, kill, SIGABRT, SIGINT, SIGSEGV};
 use std::process;
@@ -50,6 +55,71 @@ macro_rules! generate_cfg {
         // Default case if no supported target triple is matched
         return "unknown-unknown-unknown";
     };
+}
+
+#[macro_export]
+macro_rules! errorprintln {
+    ($($arg:tt)*) => ({
+        use std::io::{self, Write};
+        let _ = writeln!(
+            &mut io::stderr(),
+            "{}: {}",
+            ansi_term::Style::new().bold().fg(ansi_term::Color::Red).paint("Error"),
+            format_args!($($arg)*)
+        );
+    })
+}
+
+#[macro_export]
+macro_rules! warningprintln {
+    ($($arg:tt)*) => ({
+        use std::io::{self, Write};
+        let _ = writeln!(
+            &mut io::stderr(),
+            "{}: {}",
+            ansi_term::Style::new().bold().fg(ansi_term::Color::Yellow).paint("Warning"),
+            format_args!($($arg)*)
+        );
+    })
+}
+
+#[macro_export]
+macro_rules! noteprintln {
+    ($($arg:tt)*) => ({
+        use std::io::{self, Write};
+        let _ = writeln!(
+            &mut io::stderr(),
+            "{}: {}",
+            ansi_term::Style::new().bold().fg(ansi_term::Color::Green).paint("Note"),
+            format_args!($($arg)*)
+        );
+    })
+}
+
+#[macro_export]
+macro_rules! successprintln {
+    ($($arg:tt)*) => ({
+        use std::io::{self, Write};
+        let _ = writeln!(
+            &mut io::stderr(),
+            "{}: {}",
+            ansi_term::Style::new().bold().fg(ansi_term::Color::Green).paint("Success"),
+            format_args!($($arg)*)
+        );
+    })
+}
+
+#[macro_export]
+macro_rules! inprintln {
+    ($($arg:tt)*) => ({
+        use std::io::{self, Write};
+        let _ = writeln!(
+            &mut io::stderr(),
+            "{} {}",
+            ansi_term::Style::new().bold().fg(ansi_term::Color::Blue).paint("In"),
+            format_args!($($arg)*)
+        );
+    })
 }
 
 // A function that returns one of the available target triples
@@ -131,7 +201,44 @@ extern "C" fn handle_signal(sig: i32) {
     process::exit(3)
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> ExitCode {
+    match apolloc_main() {
+        Ok(_) => {
+            successprintln!("Specified task accomplished successfully");
+            ExitCode::SUCCESS
+        },
+        Err(e) => {
+            if let Some(parse_error) = e.downcast_ref::<ParseError>() {
+                errorprintln!("{}:{}:{}: {}", parse_error.location.defined_file_name, parse_error.location.line, parse_error.location.col, parse_error.message);
+                if let Some(file) = &parse_error.location.defined_file {
+                    let line = file.lines().collect::<Vec<_>>()[parse_error.location.line - 1];
+                    eprintln!("{}", line);
+                    eprintln!("{}{}", " ".repeat(parse_error.location.col - 1), ansi_term::Color::Red.paint("^"));
+                }
+            } else if let Some(io_error) = e.downcast_ref::<std::io::Error>() {
+                errorprintln!("{io_error}");
+            } else if let Some(checker_error) = e.downcast_ref::<CheckerError>() {
+                for function in &checker_error.3 {
+                    inprintln!("{function}:");
+                }
+                errorprintln!("{}:{}:{}: {}", checker_error.0.defined_file_name, checker_error.0.line, checker_error.0.col, checker_error.1);
+                if let Some(file) = &checker_error.0.defined_file {
+                    let line = file.lines().collect::<Vec<_>>()[checker_error.0.line - 1];
+                    eprintln!("{}", line);
+                    eprintln!("{}{}", " ".repeat(checker_error.0.col - 1), ansi_term::Color::Red.paint("^"));
+                }
+                for note in checker_error.2.iter() {
+                    noteprintln!("{}", note);
+                }
+            } else {
+                errorprintln!("{e}");
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn apolloc_main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     unsafe {
@@ -161,6 +268,8 @@ fn main() -> anyhow::Result<()> {
                 eprintln!("{} Reading input file `{input_file}`", VERBOSE_STRING.as_str());
             }
             let input = std::fs::read_to_string(&input_file)?;
+            unsafe { CURRENT_FILE.set(input.clone()) };
+            unsafe { CURRENT_FILE_NAME.set(input_file.clone()) };
 
             let mut tokenizer = Tokenizer::new(input);
             let tokens = tokenizer.tokenize().unwrap();
@@ -183,7 +292,7 @@ fn main() -> anyhow::Result<()> {
             if verbose {
                 eprintln!("{} Writing output bitcode to `./tmp/main.bc`", VERBOSE_STRING.as_str());
             }
-            std::fs::write("./tmp/main.bc", converter.get_bitcode()?)?;
+            std::fs::write("./tmp/main.bc", converter.get_bitcode(optimization as usize)?)?;
             match output_type.unwrap_or("executable".to_string()).as_str() {
                 "executable" | "exec" | "binary" | "bin" => {
                     if verbose {
@@ -195,7 +304,7 @@ fn main() -> anyhow::Result<()> {
                             "-o",
                             &output_file,
                             &format!("-O{optimization}"),
-                            "-Wno-override-module",
+                            "-Wno-override-module"
                         ])
                         .spawn()?
                         .wait()?;
@@ -215,7 +324,7 @@ fn main() -> anyhow::Result<()> {
                             let _ = std::fs::remove_dir_all("./tmp");
                         }
                         Err(anyhow!(format!(
-                            "clang++ exited with non-zero exit code: {code}"
+                            "clang exited with non-zero exit code: {code}"
                         )))
                     } else {
                         if verbose {
@@ -224,7 +333,7 @@ fn main() -> anyhow::Result<()> {
                         if !noclear {
                             let _ = std::fs::remove_dir_all("./tmp");
                         }
-                        Err(anyhow!("clang++ was terminated by a signal"))
+                        Err(anyhow!("clang was terminated by a signal"))
                     }
                 }
                 "object" | "obj" | "o" => {
@@ -238,6 +347,7 @@ fn main() -> anyhow::Result<()> {
                             &output_file,
                             &format!("-O{optimization}"),
                             "-c",
+                            "-Wno-override-module"
                         ])
                         .spawn()?
                         .wait()?;
