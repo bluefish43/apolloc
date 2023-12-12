@@ -154,7 +154,7 @@ impl Type {
         }
     }
 
-    pub fn as_type_in_builder(&self, ctx: &ApolloBuilder, is_arg_t: bool) -> LType {
+    pub fn as_type_in_builder(&self, ctx: &ApolloBuilder, _is_arg_t: bool) -> LType {
         match self {
             Type::I8 | Type::U8 => int8_type_in_context(ctx.context),
             Type::I16 | Type::U16 => int16_type_in_context(ctx.context),
@@ -170,8 +170,8 @@ impl Type {
             Type::PointerTo(to) => pointer_type(to.as_type_in_context(ctx.context), 0),
             Type::Struct {
                 name,
-                fields,
-                packed,
+                fields: _,
+                packed: _,
             } => ctx.struct_types.get(name).copied().unwrap(),
             Type::None => void_type_in_context(ctx.context),
             Type::OpaquePtr => pointer_type(void_type_in_context(ctx.context), 0),
@@ -185,8 +185,8 @@ impl Type {
         match self {
             Type::Struct {
                 name,
-                fields,
-                packed,
+                fields: _,
+                packed: _,
             } => {
                 let struct_type = ctx.struct_types.get(name).copied().unwrap();
                 let kind_id = get_enum_attribute_kind_for_name("byval");
@@ -265,11 +265,11 @@ impl fmt::Display for TokenKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TokenKind::DoubleColon => write!(f, "::"),
-            TokenKind::Char(c) => write!(f, "{} (char)", unsafe { if let Some(c) = char::from_u32(*c) {
+            TokenKind::Char(c) => write!(f, "{} (char)", if let Some(c) = char::from_u32(*c) {
                 c.to_string()
             } else {
                 "(bad char)".to_string()
-            } } ),
+            } ),
             TokenKind::PtrAccess => write!(f, "->"),
             TokenKind::Keyword(i) => write!(f, "{i} (keyword)"),
             TokenKind::Ident(i) => write!(f, "{i} (identifier)"),
@@ -366,7 +366,7 @@ impl Default for Token {
     }
 }
 
-use crate::{backend::llvm::Context, CURRENT_FILE, CURRENT_FILE_NAME};
+use crate::backend::llvm::Context;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tokenizer {
@@ -561,7 +561,7 @@ impl Tokenizer {
                         } else if number.contains('.')
                             && (number.ends_with("f32") || !number.ends_with("f64"))
                         {
-                            let number2 = number.trim_end_matches("f32");
+                            let _number2 = number.trim_end_matches("f32");
                             let parsing_result = number.parse::<f64>();
                             match parsing_result {
                                 Ok(parsed_number) => {
@@ -1173,7 +1173,7 @@ impl Tokenizer {
                                 } else if number.contains('.')
                                     && (number.ends_with("f32") || !number.ends_with("f64"))
                                 {
-                                    let number2 = number.trim_end_matches("f32");
+                                    let _number2 = number.trim_end_matches("f32");
                                     let parsing_result = number.parse::<f64>();
                                     match parsing_result {
                                         Ok(parsed_number) => {

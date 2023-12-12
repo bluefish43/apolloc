@@ -1,10 +1,10 @@
 use std::{
     collections::HashMap,
     error::Error,
-    fmt::{self, Display}, io::BufWriter,
+    fmt::{self, Display},
 };
 
-use crate::{frontend::ast::AccessModifier, untracked_mut, warningprintln};
+use crate::{untracked_mut, warningprintln};
 
 use super::{
     ast::{Class, DivType, Expression, Statement, StatementD},
@@ -38,12 +38,6 @@ impl<T> AddLocation for Result<T, CheckerError> {
             e.add_location(location);
         }
         self
-    }
-}
-
-macro_rules! write_at {
-    ($ptr:expr, $t:ty, $data:expr) => {
-        unsafe { (($ptr) as *mut $ty).write($data) }
     }
 }
 
@@ -490,7 +484,7 @@ impl<'vec> Checker<'vec> {
 
     pub fn make_token_type(&self, t: &Type, location: &Token) -> Result<ForeignType, CheckerError> {
         match t {
-            Type::Slice(t) => Ok(ForeignType::Slice(Box::new(self.make_token_type(&*t, location)?))),
+            Type::Slice(t) => Ok(ForeignType::Slice(Box::new(self.make_token_type(t, location)?))),
             Type::OpaquePtr => Ok(ForeignType::OpaquePtr),
             Type::Built(b) => match b {
                 BuiltType::Bool => Ok(ForeignType::Bool),
@@ -560,14 +554,14 @@ impl<'vec> Checker<'vec> {
     pub fn make_local_type(&mut self, t: &ForeignType) -> Result<Type, CheckerError> {
         match t {
             ForeignType::Slice(i) => {
-                Ok(Type::Slice(Box::new(self.make_local_type(&*i)?)))
+                Ok(Type::Slice(Box::new(self.make_local_type(i)?)))
             }
             ForeignType::OpaquePtr => {
                 Ok(Type::OpaquePtr)
             }
             ForeignType::Struct {
                 name,
-                fields,
+                fields: _,
                 packed,
             } => {
                 let data = self.struct_data(name, &Token::default())?;
@@ -612,7 +606,7 @@ impl<'vec> Checker<'vec> {
         let mut last_location = Token::default();
         while let Some((location, statement)) = untracked_mut!(&mut self.statements.get_mut(i), Option<&mut (Token, Statement)>) {
             last_location = location.clone();
-            let (should_stop, _return_type, glue, throws) =
+            let (should_stop, _return_type, glue, _throws) =
                 self.check_statement(statement, location)?;
             let glue_len = glue.len();
             self.statements.splice(i..i, glue.into_iter());
@@ -636,12 +630,12 @@ impl<'vec> Checker<'vec> {
     ) -> Result<(bool, Option<Type>, Vec<StatementD>, bool), CheckerError> {
         let mut may_throw = false;
         match statemento {
-            Statement::StructMethodCall(struct_value, fn_signature, struct_name, method_name, args, all_time_record_id) => {
+            Statement::StructMethodCall(struct_value, fn_signature, struct_name, method_name, _args, _all_time_record_id) => {
                 let (expr_type, ..) = self.check_expression(struct_value, location)?;
                 if let Type::Built(BuiltType::Struct {
                     name,
-                    fields,
-                    packed
+                    fields: _,
+                    packed: _
                 }) = expr_type {
                     let struct_data = self.struct_data(&name, location)?;
                     *struct_name = name;
@@ -660,13 +654,13 @@ impl<'vec> Checker<'vec> {
                 }
             }
             Statement::ClassDeclaration(name, class) => {
-                for function in &class.functions {}
+                for _function in &class.functions {}
                 self.classes.insert(name.to_string(), class.clone());
             }
-            Statement::StructFieldAssignment(variable_name, struct_field, expression, index, struct_type) => {
+            Statement::StructFieldAssignment(variable_name, struct_field, _expression, index, struct_type) => {
                 let variable_data = self.variable_data(variable_name, location)?.clone();
                 *struct_type = self.make_token_type(&variable_data.variable_type, location)?;
-                if let Type::Built(BuiltType::Struct { name, fields, packed }) = &variable_data.variable_type {
+                if let Type::Built(BuiltType::Struct { name, fields, packed: _ }) = &variable_data.variable_type {
                     let field_index = fields.iter().position(|i| &i.0 == struct_field);
                     if let Some(field_index) = field_index {
                         *index = field_index;
@@ -677,11 +671,11 @@ impl<'vec> Checker<'vec> {
                     return Err(CheckerError::new(location.clone(), format!("Cannot assign to a field of a non-struct type {}", variable_data.variable_type)))
                 }
             }
-            Statement::StructFieldIndirectAssignment(variable_name, struct_field, expression, index, struct_type) => {
+            Statement::StructFieldIndirectAssignment(variable_name, struct_field, _expression, index, struct_type) => {
                 let variable_data = self.variable_data(variable_name, location)?.clone();
                 *struct_type = self.make_token_type(&variable_data.variable_type, location)?;
                 if let Type::Built(BuiltType::PointerTo(t)) = &variable_data.variable_type {
-                    if let Type::Built(BuiltType::Struct { name, fields, packed }) = &**t {
+                    if let Type::Built(BuiltType::Struct { name, fields, packed: _ }) = &**t {
                         let field_index = fields.iter().position(|i| &i.0 == struct_field);
                         if let Some(field_index) = field_index {
                             *index = field_index;
@@ -696,9 +690,9 @@ impl<'vec> Checker<'vec> {
                 }
             }
             Statement::VariableDeclaration(variable_name, optional_specified_type, expression) => {
-                let (expression_type, throws, can_be_referenced) = self.check_expression(expression, location)?;
+                let (expression_type, throws, _can_be_referenced) = self.check_expression(expression, location)?;
                 if let Some(token_specified_type) = optional_specified_type {
-                    let specified_type = self.make_local_type(&token_specified_type)?;
+                    let specified_type = self.make_local_type(token_specified_type)?;
                     if specified_type != expression_type {
                         eprintln!("{specified_type:?} != {expression_type:?}");
                         return Err(CheckerError::new(
@@ -773,7 +767,7 @@ impl<'vec> Checker<'vec> {
                         "Cannot return at the global scope".to_string(),
                     ));
                 }
-                let (return_type, may_throw, can_be_referenced) = self.check_expression(r, location)?;
+                let (return_type, may_throw, _can_be_referenced) = self.check_expression(r, location)?;
                 if let Type::Built(BuiltType::None) = return_type {
                     *statemento = Statement::ReturnVoid;
                     return Ok((true, Some(Type::Built(BuiltType::None)), vec![], may_throw));
@@ -895,7 +889,7 @@ impl<'vec> Checker<'vec> {
                     let arg_type = args_types.next();
                     let arg_expr = args_exprs.next();
                     if let Some(arg_expr) = arg_expr {
-                        let (expression_type, throws, can_be_referenced) = arg_expr?;
+                        let (expression_type, throws, _can_be_referenced) = arg_expr?;
                         may_throw |= throws;
                         if let Some((argument_name, argument_type)) = arg_type {
                             if &expression_type != argument_type {
@@ -927,7 +921,7 @@ impl<'vec> Checker<'vec> {
                         "Cannot assign to a variable at the global scope".to_string(),
                     ));
                 }
-                let (expression_type, throws, can_be_referenced) = self.check_expression(expression, location)?;
+                let (expression_type, throws, _can_be_referenced) = self.check_expression(expression, location)?;
                 may_throw |= throws;
                 let variable_data = self.variable_data(variable_name, location)?;
                 if variable_data.variable_type != expression_type {
@@ -1038,6 +1032,7 @@ impl<'vec> Checker<'vec> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn function_definition(
         &mut self,
         name: &mut str,
@@ -1165,12 +1160,12 @@ impl<'vec> Checker<'vec> {
         location: &Token,
     ) -> Result<(Type, bool, bool), CheckerError> {
         match expression {
-            Expression::StructMethodCall(struct_value, fn_signature, struct_name, method_name, args, all_time_record_id) => {
+            Expression::StructMethodCall(struct_value, fn_signature, struct_name, method_name, _args, _all_time_record_id) => {
                 let (expr_type, ..) = self.check_expression(struct_value, location)?;
                 if let Type::Built(BuiltType::Struct {
                     name,
-                    fields,
-                    packed
+                    fields: _,
+                    packed: _
                 }) = expr_type {
                     let struct_data = self.struct_data(&name, location)?;
                     *struct_name = name;
@@ -1243,8 +1238,8 @@ impl<'vec> Checker<'vec> {
                 }
             }
             Expression::StructFieldAccess(expr, field_name, index, tt, struct_type) => {
-                let (expr_type, throws, can_be_referenced) = self.check_expression(expr, location)?;
-                if let Type::Built(BuiltType::Struct { name, fields, packed }) = expr_type.clone() {
+                let (expr_type, throws, _can_be_referenced) = self.check_expression(expr, location)?;
+                if let Type::Built(BuiltType::Struct { name, fields, packed: _ }) = expr_type.clone() {
                     if let Some((index_found, (_, field_type))) = fields.iter().enumerate().find(|field| &field.1.0 == field_name) {
                         *index = index_found;
                         *tt = self.make_token_type(field_type, location)?;
@@ -1258,9 +1253,9 @@ impl<'vec> Checker<'vec> {
                 }
             }
             Expression::IndirectStructAccess(expr, field_name, index, tt, struct_type) => {
-                let (expr_type, throws, can_be_referenced) = self.check_expression(expr, location)?;
+                let (expr_type, throws, _can_be_referenced) = self.check_expression(expr, location)?;
                 if let Type::Built(BuiltType::PointerTo(inner_t)) = expr_type.clone() {
-                    if let Type::Built(BuiltType::Struct { name, fields, packed }) = *inner_t.clone() {
+                    if let Type::Built(BuiltType::Struct { name, fields, packed: _ }) = *inner_t.clone() {
                         if let Some((index_found, (_, field_type))) = fields.iter().enumerate().find(|field| &field.1.0 == field_name) {
                             *index = index_found;
                             *tt = self.make_token_type(field_type, location)?;
@@ -1285,7 +1280,7 @@ impl<'vec> Checker<'vec> {
                 for (field_name, field_type) in &struct_data.fields {
                     let iterator = fields.iter_mut();
                     for item in iterator {
-                        let (checked, may_throw, can_be_referenced) = self.check_expression(&mut item.1, location)?;
+                        let (checked, may_throw, _can_be_referenced) = self.check_expression(&mut item.1, location)?;
                         throws |= may_throw;
                         if field_name == &item.0 && field_type == &checked {
                             ordered_fields.push((item.0.clone(), item.1.clone()));
@@ -1304,7 +1299,7 @@ impl<'vec> Checker<'vec> {
                 Ok((Type::Built(BuiltType::Struct { name: name.to_string(), fields: struct_data.fields.clone(), packed: false }), throws, false))
             }
             Expression::TypeCast(expr, ffrom, to) => {
-                let (from, throws, can_be_referenced) = self.check_expression(expr, location)?;
+                let (from, throws, _can_be_referenced) = self.check_expression(expr, location)?;
                 if (matches!(from, Type::Built(BuiltType::PointerTo(_))) && matches!(to, crate::frontend::tokens::Type::PointerTo(_))
                         || &self.make_token_type(&from, location)? == to)
                     || (matches!(from, Type::Built(BuiltType::PointerTo(_))) && matches!(to, crate::frontend::tokens::Type::OpaquePtr)
@@ -1328,7 +1323,7 @@ impl<'vec> Checker<'vec> {
                     }
                 }
             }
-            Expression::New(name, args) => {
+            Expression::New(name, _args) => {
                 let class_data = self.classes.get(name).ok_or(CheckerError::new(
                     location.clone(),
                     format!("Class `{name}` does not exist"),
@@ -1347,14 +1342,14 @@ impl<'vec> Checker<'vec> {
                 }
             }
             Expression::Deref(to, tt) => {
-                let (to_t, can_throw, can_take_reference) = self.check_expression(to, location)?;
+                let (to_t, can_throw, _can_take_reference) = self.check_expression(to, location)?;
                 if let Type::Built(BuiltType::PointerTo(to_type)) = to_t {
                     *tt = self.make_token_type(&to_type, location)?;
                     Ok((*to_type, can_throw, false))
                 } else if let Type::OpaquePtr = to_t {
                     Err(CheckerError::new(
                         location.clone(),
-                        format!("Cannot dereference `opaqueptr` because the type of the value it points to is not known at compile time")
+                        "Cannot dereference `opaqueptr` because the type of the value it points to is not known at compile time".to_string(),
                     ))
                 } else {
                     Err(CheckerError::new(
@@ -1506,7 +1501,7 @@ impl<'vec> Checker<'vec> {
                     let arg_type = args_types.next();
                     let arg_expr = args_exprs.next();
                     if let Some(arg_expr) = arg_expr {
-                        let (expression_type, throws, can_be_referenced) = arg_expr?;
+                        let (expression_type, throws, _can_be_referenced) = arg_expr?;
                         may_throw |= throws;
                         if let Some((argument_name, argument_type)) = arg_type {
                             if &expression_type != argument_type {
@@ -1563,7 +1558,7 @@ impl<'vec> Checker<'vec> {
                     ))
                 }
             }
-            Type::Built(b) if trait_ == "Copy" => {
+            Type::Built(_b) if trait_ == "Copy" => {
                 Ok(())
             }
             // Type::Generic(g) => {
