@@ -448,3 +448,4 @@ They can be spelled out by just the struct's name, such as `Person`, `Client` et
 #### Slices
 
 Slices are heap-stored arrays with a dynamic size. They can be spelled by `slice` followed by the type they store, like `slice i32`, `slice Person`, and so on.
+
