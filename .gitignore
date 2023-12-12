@@ -6,3 +6,5 @@ build.rs
 *.bc
 *.ap
 main*
+*.lock
+**/target
