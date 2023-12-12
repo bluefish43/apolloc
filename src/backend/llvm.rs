@@ -8,11 +8,11 @@ use crate::c_str;
 use crate::frontend::ast::CallingConvention;
 use llvm_sys::analysis::*;
 use llvm_sys::core::*;
-use llvm_sys::debuginfo::LLVMDIBuilderCreateFile;
+
 use llvm_sys::prelude::*;
 use llvm_sys::target::*;
 use llvm_sys::*;
-use llvm_sys::transforms::pass_builder::*;
+
 
 macro_rules! opt_c_str {
     ($e:expr) => {
@@ -1704,9 +1704,9 @@ pub enum TypeKind {
     Half,
     Float,
     Double,
-    X86_FP80,
+    X86Amx,
     FP128,
-    PPC_FP128,
+    PpcFp128,
     Label,
     Integer,
     Function,
@@ -1715,11 +1715,11 @@ pub enum TypeKind {
     Pointer,
     Vector,
     Metadata,
-    X86_MMX,
+    X86Mmx,
     Token,
     ScalableVector,
     BFloat,
-    X86_AMX,
+    X86AMx,
     TargetExt,
 }
 
@@ -1733,7 +1733,7 @@ impl Type {
     }
 
     pub fn kind(&self) -> TypeKind {
-        unsafe { std::mem::transmute(unsafe { LLVMGetTypeKind(self.0) } as c_char) }
+        unsafe { std::mem::transmute(LLVMGetTypeKind(self.0) as c_char) }
     }
 
     pub fn align_of(&self) -> Value {

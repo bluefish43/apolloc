@@ -1,7 +1,7 @@
-use anyhow::anyhow;
+
 
 use super::{
-    ast::{AccessModifier, Class, DivType, Expression, Statement, StatementD, CallingConvention},
+    ast::{Class, DivType, Expression, Statement, StatementD, CallingConvention},
     tokens::{Token, TokenKind, Type},
 };
 use std::{collections::HashMap, error::Error, fmt::Display, vec::IntoIter};
@@ -65,13 +65,12 @@ impl Parser {
                         match kw.as_str() {
                             "var" => {
                                 let variable_name = self.expect_identifier()?;
-                                let optional_type;
-                                if matches!(self.peek_token().map(|t| t.kind), Some(TokenKind::Colon)) {
+                                let optional_type = if matches!(self.peek_token().map(|t| t.kind), Some(TokenKind::Colon)) {
                                     self.next_token();
-                                    optional_type = Some(self.parse_type()?);
+                                    Some(self.parse_type()?)
                                 } else {
-                                    optional_type = None;
-                                }
+                                    None
+                                };
                                 self.expect_token(TokenKind::Equals)?;
                                 let expression = self.parse_expression()?;
                                 self.expect_token(TokenKind::Semicolon)?;

@@ -180,13 +180,14 @@ impl<'b> ApolloBuilder<'b> {
     }
 
     /// Helper function to define a function.
+    #[allow(clippy::too_many_arguments)]
     fn define_function(
         &mut self,
         function_name: &str,
         return_type: &tokens::Type,
         arguments_types: &[(String, tokens::Type)],
         function_body: Option<&[StatementD]>,
-        may_throw: bool,
+        _may_throw: bool,
         is_var_args: bool,
         calling_convention: &CallingConvention,
     ) -> Result<()> {
@@ -372,7 +373,7 @@ impl<'b> ApolloBuilder<'b> {
                 returned = true;
                 self.make_return(expression);
             }
-            Statement::VariableDeclaration(name, optional_specified_type, expression) => {
+            Statement::VariableDeclaration(name, _optional_specified_type, expression) => {
                 self.declare_variable(expression, name);
             }
             Statement::FunctionDeclaration(
@@ -457,7 +458,7 @@ impl<'b> ApolloBuilder<'b> {
     fn cleanup_action(&mut self, frame: &Frame) {
         for (action, params) in &frame.2 {
             match action {
-                CleanupAction::SliceCleanup(slice_t) => {
+                CleanupAction::SliceCleanup(_) => {
                     let malloced_slice = params[0];
                     self.builder.build_call(self.free.1, *self.free.0, &[malloced_slice], None);
                 }
@@ -662,7 +663,7 @@ impl<'b> ApolloBuilder<'b> {
         function_signature: &(tokens::Type, Vec<(String, tokens::Type)>, bool, bool),
         args: &Vec<Expression>,
         function_name: &str,
-        alltime_record_id: usize,
+        _alltime_record_id: usize,
     ) -> Value {
         let mut arguments = Vec::new();
 
@@ -747,26 +748,24 @@ impl<'b> ApolloBuilder<'b> {
         do_block: &Statement, // Changed the name to represent the do-while loop structure
         while_condition: &Expression,
     ) -> Result<(), anyhow::Error> {
-        let loop_block_condition = self
-            .current_function
-            .append_basic_block_in_context("", self.context);
-        let after_condition_block = BasicBlock::create_in_context(self.context, "");
-        let loop_block_end = BasicBlock::create_in_context(self.context, "");
-    
-        // Always execute the loop body at least once
-        self.builder.build_br(loop_block_condition);
-    
-        // Start of the loop body
-        self.current_function.append_existing_basic_block(loop_block_condition);
+        let do_basic_block = self.current_function.append_basic_block_in_context("", self.context);
+        self.builder.position_at_end(&do_basic_block);
+        
         self.evaluate_statement(do_block)?;
-    
-        // Evaluate the loop condition
-        let while_boolean = self.evaluate_expression(while_condition, ExpressionEvaluatorData::default());
-        self.builder
-            .build_conditional_br(while_boolean, loop_block_condition, after_condition_block);
-    
-        // Continue after the loop when the condition is false
-        self.current_function.append_existing_basic_block(after_condition_block);
+
+        let condition_block = BasicBlock::new_in_context(self.context, "");
+
+        self.builder.build_br(condition_block);
+
+        self.current_function.append_existing_basic_block(condition_block);
+
+        let expression = self.evaluate_expression(while_condition, ExpressionEvaluatorData::default());
+
+        let end = BasicBlock::new_in_context(self.context, "");
+
+        self.builder.build_conditional_br(expression, do_basic_block, end);
+
+        self.current_function.append_existing_basic_block(end);
     
         Ok(())
     }    
@@ -834,7 +833,7 @@ impl<'b> ApolloBuilder<'b> {
 
     /// Gets a named function in the module as a Function
     fn find_function_fn(&self, name: &str) -> Option<Function> {
-        self.module.get_named_function(name).map(|v| v)
+        self.module.get_named_function(name)
     }
 
     /// Unchecked variant.
@@ -898,7 +897,7 @@ impl<'b> ApolloBuilder<'b> {
                 let rhs = self.evaluate_expression(rhs, ExpressionEvaluatorData::default());
                 self.builder.build_xor(lhs, rhs, None)
             }
-            Expression::Eq(left, right, left_type, right_type) => {
+            Expression::Eq(left, right, left_type, _right_type) => {
                 let left = self.evaluate_expression(left, data);
                 let right = self.evaluate_expression(right, data);
                 if left_type.is_signed_int() || left_type.is_unsigned_int() {
@@ -909,7 +908,7 @@ impl<'b> ApolloBuilder<'b> {
                     unreachable!()
                 }
             }
-            Expression::Ne(left, right, left_type, right_type) => {
+            Expression::Ne(left, right, left_type, _right_type) => {
                 let left = self.evaluate_expression(left, data);
                 let right = self.evaluate_expression(right, data);
                 if left_type.is_signed_int() || left_type.is_unsigned_int() {
@@ -920,7 +919,7 @@ impl<'b> ApolloBuilder<'b> {
                     unreachable!()
                 }
             }
-            Expression::Lt(left, right, left_type, right_type) => {
+            Expression::Lt(left, right, left_type, _right_type) => {
                 let left = self.evaluate_expression(left, data);
                 let right = self.evaluate_expression(right, data);
                 if left_type.is_signed_int() {
@@ -933,7 +932,7 @@ impl<'b> ApolloBuilder<'b> {
                     unreachable!()
                 }
             }
-            Expression::Le(left, right, left_type, right_type) => {
+            Expression::Le(left, right, left_type, _right_type) => {
                 let left = self.evaluate_expression(left, data);
                 let right = self.evaluate_expression(right, data);
                 if left_type.is_signed_int() {
@@ -946,7 +945,7 @@ impl<'b> ApolloBuilder<'b> {
                     unreachable!()
                 }
             }
-            Expression::Gt(left, right, left_type, right_type) => {
+            Expression::Gt(left, right, left_type, _right_type) => {
                 let left = self.evaluate_expression(left, data);
                 let right = self.evaluate_expression(right, data);
                 if left_type.is_signed_int() {
@@ -959,7 +958,7 @@ impl<'b> ApolloBuilder<'b> {
                     unreachable!()
                 }
             }
-            Expression::Ge(left, right, left_type, right_type) => {
+            Expression::Ge(left, right, left_type, _right_type) => {
                 let left = self.evaluate_expression(left, data);
                 let right = self.evaluate_expression(right, data);
                 if left_type.is_signed_int() {
@@ -972,15 +971,15 @@ impl<'b> ApolloBuilder<'b> {
                     unreachable!()
                 }
             }
-            Expression::Reference(b, variable) => {
+            Expression::Reference(_b, variable) => {
                 self.find_variable_valueref_unchecked(variable).0
             }
-            Expression::StructFieldAccess(expr, field, field_index, target_type, struct_type) => {
+            Expression::StructFieldAccess(expr, _field, field_index, target_type, struct_type) => {
                 let struct_value = self.evaluate_expression(expr, ExpressionEvaluatorData { is_variable: false, get_variable_ptr: true, is_argument: false });
                 let field_ptr = self.builder.build_struct_get_element_ptr(struct_type.as_type_in_builder(self, false), struct_value, *field_index as u32, None);
                 self.builder.build_load(target_type.as_type_in_builder(self, false), field_ptr, None)
             }
-            Expression::IndirectStructAccess(expr, field, field_index, target_type, struct_type) => {
+            Expression::IndirectStructAccess(expr, _field, field_index, target_type, struct_type) => {
                 let struct_value = self.evaluate_expression(expr, ExpressionEvaluatorData { is_variable: false, get_variable_ptr: true, is_argument: false });
                 let struct_ptr = self.builder.build_load(pointer_type(struct_type.as_type_in_builder(self, false), 0), struct_value, None);
                 let field_ptr = self.builder.build_struct_get_element_ptr(struct_type.as_type_in_builder(self, false), struct_ptr, *field_index as u32, None);
@@ -1002,7 +1001,7 @@ impl<'b> ApolloBuilder<'b> {
             }
             Expression::TypeCast(expr, from, to) => {
                 let value = self.evaluate_expression(expr, data);
-                let from_type = from.as_type_in_builder(self, true);
+                let _from_type = from.as_type_in_builder(self, true);
                 let destine_type = to.as_type_in_builder(self, true);
                 if from.is_float() && to.is_float() {
                     self.builder.build_floating_point_cast(value, destine_type, None)
@@ -1026,7 +1025,7 @@ impl<'b> ApolloBuilder<'b> {
                     unreachable!()
                 }
             }
-            Expression::New(name, args) => {
+            Expression::New(_name, _args) => {
                 unimplemented!("constructing classes is not implemented")
             }
             Expression::Deref(expression, ttarget_type) => {
@@ -1035,12 +1034,12 @@ impl<'b> ApolloBuilder<'b> {
                 self.builder.build_load(target_type, expr_ptr, None)
             }
             Expression::UncheckedCast(expr, t) => {
-                let e = self.evaluate_expression(&expr, ExpressionEvaluatorData { is_variable: false, get_variable_ptr: true, is_argument: false });
+                let e = self.evaluate_expression(expr, ExpressionEvaluatorData { is_variable: false, get_variable_ptr: true, is_argument: false });
                 self.builder.build_bitcast(e, t.as_type_in_builder(self, true), None)
             }
             Expression::String(s) => self.builder.build_global_string(s, None),
             Expression::Variable(variable_name) => {
-                let (variable_value, variable_type, variable_expr_value) =
+                let (variable_value, variable_type, _variable_expr_value) =
                     self.find_variable_valueref_unchecked(variable_name);
                 if data.is_argument && variable_type.kind() != TypeKind::Struct {
                     self.builder.build_load(variable_type, variable_value, None)

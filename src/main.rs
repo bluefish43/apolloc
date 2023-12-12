@@ -11,8 +11,8 @@ mod frontend;
 extern crate llvm_sys;
 
 use std::process::ExitCode;
-use std::process::abort;
-use std::ptr::null_mut;
+
+
 
 use ansi_term::Color;
 use anyhow::anyhow;
@@ -20,15 +20,13 @@ use backend::builder::ApolloBuilder;
 use backend::llvm::initialize_native_asm_printer;
 use backend::llvm::initialize_native_target;
 use backend::llvm::Context;
-use clap::Arg;
-use clap::Command;
-use clap::FromArgMatches;
+
 use clap::Parser;
 use frontend::checker::Checker;
 use frontend::checker::CheckerError;
 use frontend::parser::ParseError;
 use frontend::tokens::Tokenizer;
-use libc::{signal, kill, SIGABRT, SIGINT, SIGSEGV};
+use libc::{signal, SIGABRT, SIGINT, SIGSEGV};
 use std::process;
 
 #[macro_export]
@@ -123,6 +121,7 @@ macro_rules! inprintln {
 }
 
 // A function that returns one of the available target triples
+#[allow(unreachable_code)]
 fn get_target_triple() -> &'static str {
     generate_cfg!(
         ("x86_64", "linux", "gnu"),
@@ -268,8 +267,8 @@ fn apolloc_main() -> anyhow::Result<()> {
                 eprintln!("{} Reading input file `{input_file}`", VERBOSE_STRING.as_str());
             }
             let input = std::fs::read_to_string(&input_file)?;
-            unsafe { CURRENT_FILE.set(input.clone()) };
-            unsafe { CURRENT_FILE_NAME.set(input_file.clone()) };
+            CURRENT_FILE.set(input.clone());
+            CURRENT_FILE_NAME.set(input_file.clone());
 
             let mut tokenizer = Tokenizer::new(input);
             let tokens = tokenizer.tokenize().unwrap();
@@ -526,7 +525,7 @@ fn generate_stack_dump(state: &'static str) {
     // print the current stack trace
     println!("Stack dump:");
     for (i, frame) in bt.frames().iter().enumerate() {
-        let ip = frame.ip();
+        let _ip = frame.ip();
         let symbols = frame.symbols();
         if symbols.is_empty() {
             println!("{}. <unknown>:<unknown>:<unknown>", i);
